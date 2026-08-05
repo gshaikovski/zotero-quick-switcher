@@ -1,0 +1,150 @@
+/*
+ * Zotero Quick Switcher — overlay styling.
+ *
+ * Colours come from Zotero's own CSS custom properties so the overlay follows
+ * the app's light/dark theme automatically, with plain-CSS system-colour
+ * fallbacks in case a variable is renamed in a future release.
+ *
+ * The row height is fixed and the list max-height is exactly
+ * VISIBLE_ROWS * row height, which is what makes "10 visible, scroll past 10"
+ * exact rather than approximate. Keep --zqs-row-height in sync with
+ * ZQS_Overlay.VISIBLE_ROWS if you change either.
+ */
+
+#zqs-panel {
+	--zqs-row-height: 52px;
+	--zqs-visible-rows: 10;
+
+	-moz-appearance: none;
+	appearance: none;
+	background: transparent;
+	border: none;
+	padding: 0;
+	margin: 0;
+}
+
+#zqs-panel .zqs-box {
+	display: flex;
+	flex-direction: column;
+	width: 640px;
+	max-width: 90vw;
+	overflow: hidden;
+
+	background: var(--material-menu, var(--color-menu, Menu));
+	color: var(--fill-primary, MenuText);
+	border: 1px solid var(--color-border, ThreeDShadow);
+	border-radius: 10px;
+	box-shadow: 0 12px 38px rgba(0, 0, 0, 0.34);
+}
+
+/* ---------------- input ---------------- */
+
+#zqs-panel .zqs-input {
+	appearance: none;
+	-moz-appearance: none;
+	box-sizing: border-box;
+	width: 100%;
+	padding: 14px 16px;
+	border: none;
+	border-bottom: 1px solid var(--color-border, ThreeDShadow);
+	background: transparent;
+	color: inherit;
+	font-size: 1.25em;
+	line-height: 1.3;
+	outline: none;
+}
+
+#zqs-panel .zqs-input::placeholder {
+	color: var(--fill-secondary, GrayText);
+	opacity: 1;
+}
+
+/* ---------------- result list ---------------- */
+
+#zqs-panel .zqs-list {
+	/* Exactly VISIBLE_ROWS rows tall; anything beyond scrolls. */
+	max-height: calc(var(--zqs-row-height) * var(--zqs-visible-rows));
+	overflow-y: auto;
+	overflow-x: hidden;
+	scrollbar-width: thin;
+}
+
+#zqs-panel .zqs-list:empty {
+	display: none;
+}
+
+#zqs-panel .zqs-row {
+	box-sizing: border-box;
+	height: var(--zqs-row-height);
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 0 16px;
+	cursor: default;
+	/* Fixed height means long titles must not wrap. */
+	overflow: hidden;
+}
+
+#zqs-panel .zqs-text {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+#zqs-panel .zqs-title {
+	font-size: 1.02em;
+	line-height: 1.35;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+#zqs-panel .zqs-meta {
+	font-size: 0.86em;
+	line-height: 1.3;
+	color: var(--fill-secondary, GrayText);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+#zqs-panel .zqs-row.selected {
+	background: var(--color-accent, Highlight);
+	color: var(--accent-white, HighlightText);
+}
+
+/* Keep the secondary line legible against the accent fill. */
+#zqs-panel .zqs-row.selected .zqs-meta {
+	color: inherit;
+	opacity: 0.82;
+}
+
+/* ---------------- "already open" badge ---------------- */
+
+#zqs-panel .zqs-badge {
+	flex: 0 0 auto;
+	font-size: 0.72em;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	padding: 2px 7px;
+	border-radius: 999px;
+	background: var(--fill-quinary, rgba(128, 128, 128, 0.22));
+	color: var(--fill-secondary, GrayText);
+}
+
+#zqs-panel .zqs-row.selected .zqs-badge {
+	background: rgba(255, 255, 255, 0.24);
+	color: inherit;
+}
+
+#zqs-panel .zqs-badge[hidden] {
+	display: none;
+}
+
+/* ---------------- status line ---------------- */
+
+#zqs-panel .zqs-status {
+	padding: 8px 16px;
+	font-size: 0.82em;
+	color: var(--fill-secondary, GrayText);
+	border-top: 1px solid var(--color-border, ThreeDShadow);
+}
