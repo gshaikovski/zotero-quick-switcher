@@ -13,3 +13,10 @@
 // window, by the extensions.zotero.keys.* shortcuts (which all require
 // accel+shift), or by the reader's own KeyboardManager.
 pref("extensions.quickswitcher.hotkey", "accel+O");
+
+// When true (the default), Enter always opens the paper in a Zotero reader tab.
+// When false, the switcher defers to Zotero's own file-handler preferences, so
+// a paper opens in whatever external app you configured under
+// Settings -> General -> "Open PDFs using" — matching double-click behaviour,
+// but meaning Enter may not produce a tab at all.
+pref("extensions.quickswitcher.alwaysOpenInZoteroTab", true);

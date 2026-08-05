@@ -10,8 +10,7 @@
  * Things that ARE available as bare globals:
  *   Zotero, Services, ChromeUtils, IOUtils, PathUtils, Localization,
  *   XMLSerializer, setTimeout/clearTimeout, setInterval/clearInterval,
- *   fetch, TextEncoder/TextDecoder, and the REASON constants
- *   (APP_STARTUP, ADDON_INSTALL, MAIN_WINDOW_LOAD, ...).
+ *   fetch, TextEncoder/TextDecoder, and the REASON constants.
  *
  * All DOM work therefore happens against window objects Zotero hands us, never
  * against an ambient `document`.
@@ -19,12 +18,12 @@
 
 var rootURI = null;
 
-// Windows we have attached to, so teardown is exact.
 // NOTE: bootstrap.js is NOT re-evaluated on a disable -> enable cycle
 // (plugins.js:133-135 — _loadScope early-returns when the scope already
 // exists), so module-level state survives. Everything is therefore
 // (re)initialised in startup() and fully torn down in shutdown().
 var attachedWindows = new Set();
+var pendingWindows = new Set();
 
 const MODULES = [
 	'src/engine.js',
@@ -32,55 +31,54 @@ const MODULES = [
 	'src/overlay.js',
 ];
 
-// Globals each module file defines on the window it is loaded into.
-// Cleared on teardown. These are `var` declarations inside the module files,
-// which create writable-but-non-configurable window properties, so we null
-// them out rather than `delete`-ing them (delete would silently fail).
+// Globals each module file defines on the window it is loaded into. These are
+// `var` declarations at subscript global scope, which create writable but
+// non-configurable properties — so teardown nulls them rather than `delete`-ing
+// them (delete would silently fail).
 const MODULE_GLOBALS = ['ZQS_Engine', 'ZQS_Opener', 'ZQS_Overlay'];
 
 function log(msg) {
 	Zotero.debug('[quick-switcher] ' + msg);
 }
 
-/**
- * A main window is only usable once ZoteroPane exists and the document has
- * finished parsing. At APP_STARTUP the window is already fully loaded by the
- * time plugin startup() runs (Plugins.init() is awaited at the very end of
- * Zotero.initComplete()), but onMainWindowLoad can in principle arrive earlier.
- */
+/** A main window is only usable once ZoteroPane and Zotero_Tabs exist. */
 function isWindowReady(win) {
 	return !!(win && win.document && win.ZoteroPane && win.Zotero_Tabs);
 }
 
-function attachToWindow(win) {
-	if (!win || attachedWindows.has(win)) return;
+async function attachToWindow(win) {
+	if (!win || attachedWindows.has(win) || pendingWindows.has(win)) return;
 
 	if (!isWindowReady(win)) {
-		// Wait for the window to finish loading, then try again.
-		win.addEventListener('load', function onLoad() {
-			win.removeEventListener('load', onLoad);
-			attachToWindow(win);
+		win.addEventListener('load', () => {
+			attachToWindow(win).catch((e) => {
+				Zotero.logError(new Error('[quick-switcher] deferred attach failed: ' + e));
+			});
 		}, { once: true });
 		return;
 	}
 
+	pendingWindows.add(win);
 	try {
 		for (const path of MODULES) {
 			Services.scriptloader.loadSubScript(rootURI + path, win);
 		}
-		win.ZQS_Overlay.init(win, rootURI);
+		await win.ZQS_Overlay.init(win, rootURI);
 		attachedWindows.add(win);
 		log('attached to main window');
 	}
 	catch (e) {
 		// Hook exceptions are swallowed by Zotero (plugins.js:248-267) and never
-		// surface to the user, so log loudly enough to be findable in the
-		// Debug Output / Error Console.
+		// surface to the user, so log loudly enough to be findable in the Debug
+		// Output / Error Console.
 		Zotero.logError(new Error('[quick-switcher] failed to attach to window: ' + e));
 		try {
 			detachFromWindow(win);
 		}
 		catch (ignored) {}
+	}
+	finally {
+		pendingWindows.delete(win);
 	}
 }
 
@@ -111,6 +109,7 @@ function detachFromWindow(win) {
  * Every hook is invoked as func.call(scope, params, reason) with
  * params = { id, version, rootURI } (+ { window } for the main-window hooks).
  * There is no `resourceURI` — that was Firefox's legacy bootstrap API.
+ * Returned thenables ARE awaited (plugins.js:248-267).
  * ------------------------------------------------------------------ */
 
 // eslint-disable-next-line no-unused-vars
@@ -120,25 +119,25 @@ function install(params, reason) {}
 async function startup({ rootURI: root }, reason) {
 	rootURI = root; // always ends with '/'
 	attachedWindows = new Set();
+	pendingWindows = new Set();
 
-	// Zotero.Plugins.init() runs after Zotero.initializationDeferred.resolve(),
-	// so Zotero is initialised here — but await it anyway to be explicit, since
-	// Zotero.SearchConditions must be loaded before our first addCondition()
-	// call (searchConditions.js:722-724 throws otherwise).
+	// Plugins.init() runs after Zotero.initializationDeferred.resolve(), so
+	// Zotero is already initialised — but await it explicitly, since the item
+	// and library data our index reads must be loaded.
 	await Zotero.initializationPromise;
 
-	// onMainWindowLoad does NOT fire for a main window that is already open:
-	// the Services.wm listener is registered at the END of Plugins.init(),
-	// after every plugin's startup() has run (plugins.js:93-124). So the
-	// already-open window is ours to handle.
+	// onMainWindowLoad does NOT fire for a main window that is already open: the
+	// Services.wm listener is registered at the END of Plugins.init(), after
+	// every plugin's startup() has run (plugins.js:93-124). The already-open
+	// window is ours to handle.
 	for (const win of Zotero.getMainWindows()) {
-		attachToWindow(win);
+		await attachToWindow(win);
 	}
 }
 
 // eslint-disable-next-line no-unused-vars
 function onMainWindowLoad({ window: win }, reason) {
-	attachToWindow(win);
+	return attachToWindow(win);
 }
 
 // eslint-disable-next-line no-unused-vars
@@ -155,6 +154,7 @@ function shutdown(params, reason) {
 		detachFromWindow(win);
 	}
 	attachedWindows = new Set();
+	pendingWindows = new Set();
 	rootURI = null;
 }
 

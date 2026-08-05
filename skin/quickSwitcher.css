@@ -1,45 +1,63 @@
 /*
  * Zotero Quick Switcher — overlay styling.
  *
- * Colours come from Zotero's own CSS custom properties so the overlay follows
- * the app's light/dark theme automatically, with plain-CSS system-colour
- * fallbacks in case a variable is renamed in a future release.
+ * Injected as <style> text (not a <link>), appended to documentElement, so it
+ * comes last in document order and wins cascade ties against Zotero's own
+ * stylesheet processing instructions.
+ *
+ * Colours come from Zotero's CSS custom properties so the overlay follows the
+ * app's light/dark theme, with system-colour fallbacks in case a variable is
+ * renamed in a future release.
  *
  * The row height is fixed and the list max-height is exactly
- * VISIBLE_ROWS * row height, which is what makes "10 visible, scroll past 10"
- * exact rather than approximate. Keep --zqs-row-height in sync with
- * ZQS_Overlay.VISIBLE_ROWS if you change either.
+ * --zqs-visible-rows * --zqs-row-h, which is what makes "10 visible, scroll
+ * past 10" exact rather than approximate.
  */
 
-#zqs-panel {
-	--zqs-row-height: 52px;
+#zqs-overlay {
+	--zqs-row-h: 52px;
 	--zqs-visible-rows: 10;
+	--zqs-width: 640px;
 
-	-moz-appearance: none;
-	appearance: none;
-	background: transparent;
-	border: none;
-	padding: 0;
-	margin: 0;
-}
-
-#zqs-panel .zqs-box {
+	position: fixed;
+	inset: 0;
+	z-index: 2147483000;
 	display: flex;
 	flex-direction: column;
-	width: 640px;
-	max-width: 90vw;
+	align-items: center;
+	/* Sits a little above centre, Obsidian-style. */
+	padding-top: 12vh;
+	pointer-events: auto;
+}
+
+#zqs-overlay[hidden] {
+	display: none;
+}
+
+#zqs-overlay .zqs-backdrop {
+	position: absolute;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.32);
+}
+
+#zqs-overlay .zqs-modal {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	width: var(--zqs-width);
+	max-width: 92vw;
 	overflow: hidden;
 
 	background: var(--material-menu, var(--color-menu, Menu));
 	color: var(--fill-primary, MenuText);
 	border: 1px solid var(--color-border, ThreeDShadow);
 	border-radius: 10px;
-	box-shadow: 0 12px 38px rgba(0, 0, 0, 0.34);
+	box-shadow: 0 16px 48px rgba(0, 0, 0, 0.42);
 }
 
 /* ---------------- input ---------------- */
 
-#zqs-panel .zqs-input {
+#zqs-overlay .zqs-input {
 	appearance: none;
 	-moz-appearance: none;
 	box-sizing: border-box;
@@ -49,33 +67,34 @@
 	border-bottom: 1px solid var(--color-border, ThreeDShadow);
 	background: transparent;
 	color: inherit;
+	font: inherit;
 	font-size: 1.25em;
 	line-height: 1.3;
 	outline: none;
+	box-shadow: none;
 }
 
-#zqs-panel .zqs-input::placeholder {
+#zqs-overlay .zqs-input::placeholder {
 	color: var(--fill-secondary, GrayText);
 	opacity: 1;
 }
 
 /* ---------------- result list ---------------- */
 
-#zqs-panel .zqs-list {
-	/* Exactly VISIBLE_ROWS rows tall; anything beyond scrolls. */
-	max-height: calc(var(--zqs-row-height) * var(--zqs-visible-rows));
+#zqs-overlay .zqs-list {
+	max-height: calc(var(--zqs-row-h) * var(--zqs-visible-rows));
 	overflow-y: auto;
 	overflow-x: hidden;
 	scrollbar-width: thin;
 }
 
-#zqs-panel .zqs-list:empty {
+#zqs-overlay .zqs-list:empty {
 	display: none;
 }
 
-#zqs-panel .zqs-row {
+#zqs-overlay .zqs-row {
 	box-sizing: border-box;
-	height: var(--zqs-row-height);
+	height: var(--zqs-row-h);
 	display: flex;
 	align-items: center;
 	gap: 10px;
@@ -85,12 +104,12 @@
 	overflow: hidden;
 }
 
-#zqs-panel .zqs-text {
+#zqs-overlay .zqs-text {
 	flex: 1 1 auto;
 	min-width: 0;
 }
 
-#zqs-panel .zqs-title {
+#zqs-overlay .zqs-title {
 	font-size: 1.02em;
 	line-height: 1.35;
 	white-space: nowrap;
@@ -98,7 +117,7 @@
 	text-overflow: ellipsis;
 }
 
-#zqs-panel .zqs-meta {
+#zqs-overlay .zqs-meta {
 	font-size: 0.86em;
 	line-height: 1.3;
 	color: var(--fill-secondary, GrayText);
@@ -107,20 +126,19 @@
 	text-overflow: ellipsis;
 }
 
-#zqs-panel .zqs-row.selected {
+#zqs-overlay .zqs-row.selected {
 	background: var(--color-accent, Highlight);
 	color: var(--accent-white, HighlightText);
 }
 
-/* Keep the secondary line legible against the accent fill. */
-#zqs-panel .zqs-row.selected .zqs-meta {
+#zqs-overlay .zqs-row.selected .zqs-meta {
 	color: inherit;
 	opacity: 0.82;
 }
 
 /* ---------------- "already open" badge ---------------- */
 
-#zqs-panel .zqs-badge {
+#zqs-overlay .zqs-badge {
 	flex: 0 0 auto;
 	font-size: 0.72em;
 	text-transform: uppercase;
@@ -131,18 +149,14 @@
 	color: var(--fill-secondary, GrayText);
 }
 
-#zqs-panel .zqs-row.selected .zqs-badge {
+#zqs-overlay .zqs-row.selected .zqs-badge {
 	background: rgba(255, 255, 255, 0.24);
 	color: inherit;
 }
 
-#zqs-panel .zqs-badge[hidden] {
-	display: none;
-}
-
 /* ---------------- status line ---------------- */
 
-#zqs-panel .zqs-status {
+#zqs-overlay .zqs-status {
 	padding: 8px 16px;
 	font-size: 0.82em;
 	color: var(--fill-secondary, GrayText);

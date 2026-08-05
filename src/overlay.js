@@ -1,55 +1,65 @@
 /**
  * Zotero Quick Switcher — the overlay UI.
  *
- * Why a XUL <panel> and not an absolutely-positioned <div>:
- * a reader tab is a XUL <browser> living inside <deck id="tabs-deck"> inside
- * <stack id="zotero-pane-stack">. A sibling div in that stack is not a reliable
- * way to paint over a browser element, whereas a <panel> renders in its own
- * popup layer, always above content. It is also the pattern Zotero itself uses
- * for the closest existing UI — the tabs menu (elements/tabsMenuPanel.js), a
- * filterable list with a preselected row and arrow-key navigation.
+ * WHY A position:fixed XHTML DIV AND NOT A XUL <panel>
  *
- * Hotkey capture: a CAPTURE-phase keydown listener on the chrome document.
- * The reader is in-process (its <browser> sets neither remote nor
- * maychangeremoteness, reader.js:1812-1818), so content key events do travel
- * through the chrome document, and capture phase runs before the reader's own
- * capturing handler (resource/reader/reader.js:72684-72690) can call
- * stopPropagation() on the combos it claims. This is exactly how Zotero
- * implements Cmd+W-closes-a-reader-tab (ZoteroPane.captureKeyDown,
- * zoteroPane.js:79-81, 921-1043).
+ *   - A <panel> "completely takes over Escape keydown event, by attaching a
+ *     capturing keydown listener to document which just closes the popup" —
+ *     Zotero's own comment at xpcom/reader.js:1202-1204, where they had to work
+ *     around it. We want Escape ourselves.
+ *   - On macOS a panel is a separate native window, so hiding it triggers an
+ *     OS-level key-window transfer that races the setTimeout(…, 0) refocus hook
+ *     Zotero_Tabs.select() fires (tabs.js:941-944). Enter must hide the overlay
+ *     before switching tabs, and with a div that is a synchronous display:none.
+ *   - Precedent that a fixed div reliably paints over a reader <browser>:
+ *     #zotero-tab-cover (zoteroPane.xhtml:1101 + skin/…/overlay.css:137-150) is
+ *     exactly this construct.
+ *
+ * HOTKEY CAPTURE
+ *
+ * A capture-phase keydown listener on the chrome WINDOW. The reader is an
+ * in-process, non-remote <browser> (reader.js:1812-1818), so content key events
+ * travel through the chrome window, and capture runs before the reader's own
+ * capturing handler (resource/reader/reader.js:72684-72690) can stopPropagation()
+ * the combos it claims. The window is used rather than the document because
+ * ZoteroPane already holds a capture listener on the document
+ * (zoteroPane.js:79-81) — one level higher means we run first regardless of
+ * registration order.
  */
 
 var ZQS_Overlay = {
-	PANEL_ID: 'zqs-panel',
-	STYLESHEET_ID: 'zqs-stylesheet',
+	ROOT_ID: 'zqs-overlay',
+	STYLE_ID: 'zqs-style',
 	MAX_RESULTS: 50,
-	VISIBLE_ROWS: 10,
-	DEBOUNCE_MS: 130,
+	DEBOUNCE_MS: 110,
 
 	_win: null,
 	_doc: null,
 	_rootURI: null,
-	_panel: null,
+
+	_root: null,
+	_backdrop: null,
 	_input: null,
 	_list: null,
 	_status: null,
-	_link: null,
+	_style: null,
 
 	_results: [],
 	_selectedIndex: 0,
 	_searchSeq: 0,
 	_debounceTimer: null,
 	_hotkey: null,
+	_visible: false,
+	_lastPointer: null,
 
 	_onKeyDownCapture: null,
 	_onWindowDeactivate: null,
-	_onMouseDownCapture: null,
 
 	/* ---------------------------------------------------------------- *
 	 * Lifecycle
 	 * ---------------------------------------------------------------- */
 
-	init(win, rootURI) {
+	async init(win, rootURI) {
 		this._win = win;
 		this._doc = win.document;
 		this._rootURI = rootURI;
@@ -58,64 +68,63 @@ var ZQS_Overlay = {
 		win.ZQS_Opener.init(win);
 
 		this._hotkey = this._readHotkeyPref();
-		this._injectStylesheet();
-		this._buildPanel();
+		await this._injectStylesheet();
+		this._buildDOM();
 
 		this._onKeyDownCapture = this._handleKeyDownCapture.bind(this);
-		// Capture phase on the document — see file header.
-		this._doc.addEventListener('keydown', this._onKeyDownCapture, true);
+		win.addEventListener('keydown', this._onKeyDownCapture, true);
 
 		this._onWindowDeactivate = () => this.close();
 		win.addEventListener('deactivate', this._onWindowDeactivate);
 
-		this._onMouseDownCapture = (event) => {
-			if (!this.isOpen()) return;
-			if (this._panel && !this._panel.contains(event.target)) this.close();
-		};
-		this._doc.addEventListener('mousedown', this._onMouseDownCapture, true);
+		// Warm the index in the background so the first Cmd+O is instant.
+		win.ZQS_Engine.ensureIndex().catch((e) => {
+			Zotero.debug('[quick-switcher] initial index build failed: ' + e);
+		});
 	},
 
 	destroy() {
 		const win = this._win;
-		const doc = this._doc;
 
-		if (doc && this._onKeyDownCapture) {
-			doc.removeEventListener('keydown', this._onKeyDownCapture, true);
+		// Invalidate anything in flight BEFORE nulling fields, so a suspended
+		// _runSearch cannot resume and dereference a null _doc.
+		this._searchSeq++;
+		this._visible = false;
+
+		if (this._debounceTimer && win) {
+			try {
+				win.clearTimeout(this._debounceTimer);
+			}
+			catch (e) {}
 		}
-		if (doc && this._onMouseDownCapture) {
-			doc.removeEventListener('mousedown', this._onMouseDownCapture, true);
+		this._debounceTimer = null;
+
+		if (win && this._onKeyDownCapture) {
+			win.removeEventListener('keydown', this._onKeyDownCapture, true);
 		}
 		if (win && this._onWindowDeactivate) {
 			win.removeEventListener('deactivate', this._onWindowDeactivate);
 		}
-		if (this._debounceTimer) {
-			win.clearTimeout(this._debounceTimer);
-			this._debounceTimer = null;
-		}
 
-		try {
-			if (this._panel) {
-				if (this.isOpen()) this._panel.hidePopup();
-				this._panel.remove();
+		for (const el of [this._root, this._style]) {
+			try {
+				if (el) el.remove();
 			}
+			catch (e) {}
 		}
-		catch (e) {}
-
-		try {
-			if (this._link) this._link.remove();
-		}
-		catch (e) {}
 
 		try {
 			if (win && win.ZQS_Engine) win.ZQS_Engine.destroy();
 			if (win && win.ZQS_Opener) win.ZQS_Opener.destroy();
 		}
-		catch (e) {}
+		catch (e) {
+			Zotero.logError(new Error('[quick-switcher] module teardown failed: ' + e));
+		}
 
-		this._panel = this._input = this._list = this._status = this._link = null;
+		this._root = this._backdrop = this._input = this._list = this._status = this._style = null;
 		this._results = [];
 		this._win = this._doc = null;
-		this._onKeyDownCapture = this._onWindowDeactivate = this._onMouseDownCapture = null;
+		this._onKeyDownCapture = this._onWindowDeactivate = null;
 	},
 
 	/* ---------------------------------------------------------------- *
@@ -147,8 +156,8 @@ var ZQS_Overlay = {
 		const hk = this._hotkey;
 		if (!hk) return false;
 
-		// Match on either the logical key or the physical code, so the binding
-		// survives non-US keyboard layouts.
+		// event.code is layout-independent; event.key is uppercased when Shift
+		// is held. Accept either so the binding survives odd layouts.
 		const key = (event.key || '').toLowerCase();
 		const code = (event.code || '').toLowerCase();
 		if (key !== hk.key && code !== 'key' + hk.key) return false;
@@ -166,33 +175,48 @@ var ZQS_Overlay = {
 		if (this._matchesHotkey(event)) {
 			event.preventDefault();
 			event.stopPropagation();
+			// stopPropagation alone still lets system-group XUL <key> handlers
+			// run; this is Zotero's own idiom (zoteroPane.js:932-933).
+			event.stopImmediatePropagation();
 			this.toggle();
 			return;
 		}
 
-		if (!this.isOpen()) return;
+		if (!this._visible) return;
 
-		// While open, we own these keys wherever focus happens to be.
+		const consume = () => {
+			event.preventDefault();
+			event.stopPropagation();
+			event.stopImmediatePropagation();
+		};
+
 		switch (event.key) {
 			case 'Escape':
-				event.preventDefault();
-				event.stopPropagation();
+				consume();
 				this.close();
 				break;
 			case 'ArrowDown':
-				event.preventDefault();
-				event.stopPropagation();
+				consume();
 				this._move(1);
 				break;
 			case 'ArrowUp':
-				event.preventDefault();
-				event.stopPropagation();
+				consume();
 				this._move(-1);
 				break;
+			case 'Home':
+				consume();
+				this._select(0);
+				break;
+			case 'End':
+				consume();
+				this._select(this._results.length - 1);
+				break;
 			case 'Enter':
-				event.preventDefault();
-				event.stopPropagation();
-				this._activate();
+				consume();
+				this._activate({
+					reveal: event.shiftKey,
+					background: Zotero.isMac ? event.metaKey : event.ctrlKey,
+				});
 				break;
 			default:
 				break;
@@ -200,40 +224,64 @@ var ZQS_Overlay = {
 	},
 
 	/* ---------------------------------------------------------------- *
-	 * DOM construction
+	 * DOM
 	 * ---------------------------------------------------------------- */
 
-	_injectStylesheet() {
+	/**
+	 * Inject the stylesheet as <style> TEXT, not <link href>.
+	 * A <link> pointing at rootURI works for an unpacked dev install
+	 * (file:///) but is unproven for a packed .xpi (jar:file:///…!/). Reading
+	 * the text and injecting it is scheme-agnostic, and appending to
+	 * documentElement puts it last in document order so it wins cascade ties.
+	 * This mirrors Zotero's own runtime-CSS pattern
+	 * (components/virtualized-table.js:1543-1550).
+	 */
+	async _injectStylesheet() {
 		const doc = this._doc;
-		if (doc.getElementById(this.STYLESHEET_ID)) return;
-		const link = doc.createElement('link');
-		link.id = this.STYLESHEET_ID;
-		link.rel = 'stylesheet';
-		link.href = this._rootURI + 'skin/quickSwitcher.css';
-		doc.documentElement.appendChild(link);
-		this._link = link;
-	},
-
-	_buildPanel() {
-		const doc = this._doc;
-
-		const existing = doc.getElementById(this.PANEL_ID);
+		const existing = doc.getElementById(this.STYLE_ID);
 		if (existing) existing.remove();
 
-		// createXULElement for the panel; plain createElement for the HTML
-		// content inside it (zoteroPane.xhtml is an XHTML document).
-		const panel = doc.createXULElement('panel');
-		panel.id = this.PANEL_ID;
-		panel.setAttribute('noautohide', 'true');
-		panel.setAttribute('level', 'parent');
-		panel.setAttribute('role', 'dialog');
+		let css = '';
+		try {
+			css = await Zotero.File.getResourceAsync(this._rootURI + 'skin/quickSwitcher.css');
+		}
+		catch (e) {
+			Zotero.logError(new Error('[quick-switcher] could not read stylesheet: ' + e));
+			return;
+		}
 
-		const box = doc.createElement('div');
-		box.className = 'zqs-box';
+		const style = doc.createElement('style');
+		style.id = this.STYLE_ID;
+		style.textContent = css;
+		doc.documentElement.appendChild(style);
+		this._style = style;
+	},
+
+	_buildDOM() {
+		const doc = this._doc;
+
+		const existing = doc.getElementById(this.ROOT_ID);
+		if (existing) existing.remove();
+
+		// zoteroPane.xhtml is an XHTML document, so createElement yields HTML
+		// elements. createXULElement is only needed for XUL widgets; we use none.
+		const root = doc.createElement('div');
+		root.id = this.ROOT_ID;
+		root.setAttribute('hidden', 'true');
+
+		const backdrop = doc.createElement('div');
+		backdrop.className = 'zqs-backdrop';
+
+		const modal = doc.createElement('div');
+		modal.className = 'zqs-modal';
+		modal.setAttribute('role', 'combobox');
+		modal.setAttribute('aria-expanded', 'true');
 
 		const input = doc.createElement('input');
 		input.className = 'zqs-input';
 		input.setAttribute('type', 'text');
+		input.setAttribute('autocomplete', 'off');
+		input.setAttribute('spellcheck', 'false');
 		input.setAttribute('placeholder', 'Search your library…');
 		input.setAttribute('aria-label', 'Search your library');
 
@@ -244,47 +292,64 @@ var ZQS_Overlay = {
 		const status = doc.createElement('div');
 		status.className = 'zqs-status';
 
-		box.appendChild(input);
-		box.appendChild(list);
-		box.appendChild(status);
-		panel.appendChild(box);
-
-		// The popupset is where Zotero keeps its own panels.
-		const host = doc.querySelector('popupset') || doc.documentElement;
-		host.appendChild(panel);
+		modal.appendChild(input);
+		modal.appendChild(list);
+		modal.appendChild(status);
+		root.appendChild(backdrop);
+		root.appendChild(modal);
+		doc.documentElement.appendChild(root);
 
 		input.addEventListener('input', () => this._onInput());
-		panel.addEventListener('popupshown', () => {
-			// Focus must wait for popupshown, otherwise it lands nowhere when
-			// the previous focus was inside a reader iframe.
-			input.focus();
-			input.select();
+		backdrop.addEventListener('mousedown', (e) => {
+			e.preventDefault();
+			this.close();
 		});
 
+		// Resolve rows by ITEM ID, never by array index: _render() replaces the
+		// list wholesale, but closest() still walks a detached node's ancestors,
+		// so a click landing on a row from a previous render would otherwise
+		// index into a different result array and open the wrong paper.
 		list.addEventListener('click', (event) => {
-			const row = event.target.closest('.zqs-row');
-			if (!row) return;
-			const idx = parseInt(row.dataset.index, 10);
-			if (!isNaN(idx)) {
-				this._selectedIndex = idx;
-				this._activate();
-			}
+			const idx = this._indexFromEvent(event);
+			if (idx === -1) return;
+			this._selectedIndex = idx;
+			this._activate({
+				reveal: event.shiftKey,
+				background: Zotero.isMac ? event.metaKey : event.ctrlKey,
+			});
 		});
 
 		list.addEventListener('mousemove', (event) => {
-			const row = event.target.closest('.zqs-row');
-			if (!row) return;
-			const idx = parseInt(row.dataset.index, 10);
-			if (!isNaN(idx) && idx !== this._selectedIndex) {
+			// Gecko synthesizes mousemove at the last cursor position on every
+			// reflow and scroll (that is how :hover stays correct), and we
+			// scrollIntoView on every arrow key. Without this guard the row
+			// under a stationary pointer would steal the selection and the
+			// user could never arrow past it.
+			const p = this._lastPointer;
+			if (p && p.x === event.screenX && p.y === event.screenY) return;
+			this._lastPointer = { x: event.screenX, y: event.screenY };
+
+			const idx = this._indexFromEvent(event);
+			if (idx !== -1 && idx !== this._selectedIndex) {
 				this._selectedIndex = idx;
 				this._paintSelection();
 			}
 		});
 
-		this._panel = panel;
+		this._root = root;
+		this._backdrop = backdrop;
 		this._input = input;
 		this._list = list;
 		this._status = status;
+	},
+
+	/** Map a pointer event to an index in the CURRENT result array, or -1. */
+	_indexFromEvent(event) {
+		const row = event.target.closest ? event.target.closest('.zqs-row') : null;
+		if (!row || !this._list || !this._list.contains(row)) return -1;
+		const id = Number(row.dataset.itemId);
+		if (!id) return -1;
+		return this._results.findIndex(r => r.entry.id === id);
 	},
 
 	/* ---------------------------------------------------------------- *
@@ -292,39 +357,76 @@ var ZQS_Overlay = {
 	 * ---------------------------------------------------------------- */
 
 	isOpen() {
-		return !!this._panel && ['showing', 'open'].includes(this._panel.state);
+		return this._visible;
 	},
 
 	toggle() {
-		if (this.isOpen()) this.close();
+		if (this._visible) this.close();
 		else this.open();
 	},
 
 	open() {
-		if (!this._panel || this.isOpen()) return;
-		const win = this._win;
+		if (!this._root || this._visible) return;
 
+		this._cancelPending();
 		this._results = [];
 		this._selectedIndex = 0;
+		this._lastPointer = null;
 		this._input.value = '';
 		this._list.replaceChildren();
 		this._setStatus('Type to search your library');
 
-		// Centred horizontally, a bit above the middle — Obsidian-like.
-		const width = 640;
-		const x = win.screenX + Math.max(0, Math.round((win.outerWidth - width) / 2));
-		const y = win.screenY + Math.round(win.outerHeight * 0.16);
-		this._panel.openPopupAtScreen(x, y, false);
+		this._root.removeAttribute('hidden');
+		this._visible = true;
+
+		this._focusInput();
 	},
 
 	close() {
-		if (!this._panel || !this.isOpen()) return;
+		if (!this._root || !this._visible) return;
+		this._cancelPending();
+		this._visible = false;
+		this._root.setAttribute('hidden', 'true');
 		try {
-			this._panel.hidePopup();
+			this._input.blur();
 		}
 		catch (e) {}
-		// Invalidate any search still in flight.
+	},
+
+	/** Cancel the debounce AND invalidate any search already past it. */
+	_cancelPending() {
+		if (this._debounceTimer && this._win) {
+			try {
+				this._win.clearTimeout(this._debounceTimer);
+			}
+			catch (e) {}
+		}
+		this._debounceTimer = null;
 		this._searchSeq++;
+	},
+
+	/**
+	 * Focus can be coming back from inside a reader iframe, so verify it landed
+	 * and retry once on the next tick if it didn't.
+	 */
+	_focusInput() {
+		const input = this._input;
+		if (!input) return;
+		try {
+			input.focus();
+			input.select();
+		}
+		catch (e) {}
+
+		this._win.setTimeout(() => {
+			if (!this._visible || !this._input || !this._doc) return;
+			if (this._doc.activeElement !== this._input) {
+				try {
+					this._input.focus();
+				}
+				catch (e) {}
+			}
+		}, 0);
 	},
 
 	/* ---------------------------------------------------------------- *
@@ -333,21 +435,29 @@ var ZQS_Overlay = {
 
 	_onInput() {
 		const win = this._win;
+		if (!win) return;
 		if (this._debounceTimer) win.clearTimeout(this._debounceTimer);
+		const value = this._input.value;
 		this._debounceTimer = win.setTimeout(() => {
 			this._debounceTimer = null;
-			this._runSearch(this._input.value);
+			if (!this._visible) return; // dismissed while the timer was pending
+			this._runSearch(value);
 		}, this.DEBOUNCE_MS);
+	},
+
+	/** True if this search is still the current one and the UI still exists. */
+	_stillCurrent(seq) {
+		return seq === this._searchSeq && !!this._doc && this._visible;
 	},
 
 	async _runSearch(query) {
 		const seq = ++this._searchSeq;
 		const trimmed = (query || '').trim();
 
-		if (trimmed.length < this._win.ZQS_Engine.MIN_QUERY_LENGTH) {
+		if (!trimmed) {
 			this._results = [];
-			this._render();
-			this._setStatus(trimmed ? 'Keep typing…' : 'Type to search your library');
+			this._renderSafely();
+			this._setStatus('Type to search your library');
 			return;
 		}
 
@@ -357,101 +467,139 @@ var ZQS_Overlay = {
 		}
 		catch (e) {
 			Zotero.logError(new Error('[quick-switcher] search failed: ' + e));
-			if (seq !== this._searchSeq) return;
+			if (!this._stillCurrent(seq)) return;
 			this._results = [];
-			this._render();
+			this._renderSafely();
 			this._setStatus('Search failed — see Debug Output');
 			return;
 		}
 
-		// A newer keystroke already started; drop these results.
-		if (seq !== this._searchSeq) return;
+		if (!this._stillCurrent(seq)) return;
 
 		this._results = payload.results;
 		this._selectedIndex = 0;
-		this._render();
+		this._renderSafely();
 
 		if (!this._results.length) {
 			this._setStatus('No matches');
 		}
 		else {
-			const n = this._results.length;
-			this._setStatus(`${n} result${n === 1 ? '' : 's'}${payload.truncated ? ' (narrowed)' : ''}`);
+			const shown = this._results.length;
+			const more = payload.total > shown ? ` of ${payload.total}` : '';
+			this._setStatus(`${shown}${more} result${payload.total === 1 ? '' : 's'}`);
 		}
-
-		this._markOpenTabs(seq);
 	},
 
 	/* ---------------------------------------------------------------- *
 	 * Rendering
 	 * ---------------------------------------------------------------- */
 
+	/**
+	 * Render, and on failure reset _results so the array can never disagree
+	 * with what is actually on screen (pressing Enter on an apparently empty
+	 * list must not open something invisible).
+	 */
+	_renderSafely() {
+		try {
+			this._render();
+		}
+		catch (e) {
+			Zotero.logError(new Error('[quick-switcher] render failed: ' + e));
+			this._results = [];
+			this._selectedIndex = 0;
+			try {
+				this._list.replaceChildren();
+			}
+			catch (ignored) {}
+		}
+	},
+
 	_render() {
 		const doc = this._doc;
-		const rows = doc.createDocumentFragment();
+		if (!doc || !this._list) return;
 
-		this._results.forEach(({ item }, index) => {
+		const win = this._win;
+		const tabs = win && win.Zotero_Tabs;
+		const frag = doc.createDocumentFragment();
+
+		this._results.forEach(({ entry }, index) => {
 			const row = doc.createElement('div');
 			row.className = 'zqs-row';
+			row.dataset.itemId = String(entry.id);
 			row.dataset.index = String(index);
 			row.setAttribute('role', 'option');
 
+			const text = doc.createElement('div');
+			text.className = 'zqs-text';
+
 			const title = doc.createElement('div');
 			title.className = 'zqs-title';
-			title.textContent = item.getDisplayTitle() || '(untitled)';
+			title.textContent = entry.title || '(untitled)';
 
 			const meta = doc.createElement('div');
 			meta.className = 'zqs-meta';
-			meta.textContent = this._metaLine(item);
+			meta.textContent = [entry.firstCreator, entry.year, entry.publication]
+				.filter(Boolean).join('  ·  ');
 
-			const badge = doc.createElement('span');
-			badge.className = 'zqs-badge';
-			badge.hidden = true;
-			badge.textContent = 'open';
-
-			const text = doc.createElement('div');
-			text.className = 'zqs-text';
 			text.appendChild(title);
 			text.appendChild(meta);
-
 			row.appendChild(text);
-			row.appendChild(badge);
-			rows.appendChild(row);
+
+			// The attachment id is resolved synchronously at index time, so the
+			// "already open" badge needs no async work per row.
+			if (entry.attachmentID && tabs) {
+				let tabID;
+				try {
+					tabID = tabs.getTabIDByItemID(Number(entry.attachmentID));
+				}
+				catch (e) {}
+				if (tabID) {
+					const badge = doc.createElement('span');
+					badge.className = 'zqs-badge';
+					badge.textContent = 'open';
+					row.appendChild(badge);
+				}
+			}
+
+			frag.appendChild(row);
 		});
 
-		this._list.replaceChildren(rows);
+		this._list.replaceChildren(frag);
 		this._paintSelection();
 	},
 
-	_metaLine(item) {
-		const bits = [];
-		try {
-			const creator = item.getField('firstCreator', true);
-			if (creator) bits.push(creator);
-			const year = item.getField('year');
-			if (year) bits.push(year);
-			const pub = item.getField('publicationTitle');
-			if (pub) bits.push(pub);
-		}
-		catch (e) {}
-		return bits.join('  ·  ');
-	},
-
 	_paintSelection() {
+		if (!this._list) return;
 		const rows = this._list.children;
+		if (!rows.length) return;
+
+		// Keep the index inside the current result set at all times.
+		if (this._selectedIndex >= rows.length) this._selectedIndex = rows.length - 1;
+		if (this._selectedIndex < 0) this._selectedIndex = 0;
+
 		for (let i = 0; i < rows.length; i++) {
 			const selected = i === this._selectedIndex;
 			rows[i].classList.toggle('selected', selected);
 			rows[i].setAttribute('aria-selected', selected ? 'true' : 'false');
-			if (selected) rows[i].scrollIntoView({ block: 'nearest' });
+			if (selected) {
+				try {
+					rows[i].scrollIntoView({ block: 'nearest' });
+				}
+				catch (e) {}
+			}
 		}
 	},
 
-	_move(delta) {
+	_select(index) {
 		if (!this._results.length) return;
+		this._selectedIndex = Math.max(0, Math.min(index, this._results.length - 1));
+		this._paintSelection();
+	},
+
+	_move(delta) {
 		const n = this._results.length;
-		// Wrap around, like Obsidian's switcher.
-		this._selectedIndex = ((this._selectedIndex + delta) % n + n) % n;
+		if (!n) return;
+		this._selectedIndex = ((this._selectedIndex + delta) % n + n) % n; // wraps
 		this._paintSelection();
 	},
 
@@ -459,43 +607,37 @@ var ZQS_Overlay = {
 		if (this._status) this._status.textContent = text;
 	},
 
-	/**
-	 * Badge rows whose paper already has a tab open. Async and best-effort:
-	 * a stale sequence number just means the user kept typing.
-	 */
-	async _markOpenTabs(seq) {
-		const opener = this._win.ZQS_Opener;
-		const rows = [...this._list.children];
-
-		for (let i = 0; i < rows.length; i++) {
-			if (seq !== this._searchSeq) return;
-			const entry = this._results[i];
-			if (!entry) continue;
-			let tabID = null;
-			try {
-				tabID = await opener.getOpenTabID(entry.item);
-			}
-			catch (e) {}
-			if (seq !== this._searchSeq) return;
-			const badge = rows[i].querySelector('.zqs-badge');
-			if (badge) badge.hidden = !tabID;
-		}
-	},
-
 	/* ---------------------------------------------------------------- *
 	 * Activation
 	 * ---------------------------------------------------------------- */
 
-	_activate() {
+	_activate({ reveal = false, background = false } = {}) {
 		const entry = this._results[this._selectedIndex];
 		if (!entry) return;
 
-		// Close FIRST. Both Zotero_Tabs.select() and Zotero.Reader.open() move
-		// focus (tabs.js:941-959, reader.js:2786-2790), and there is no option
-		// to leave it alone — so the overlay must be gone before we open.
+		const win = this._win;
+
+		// Zotero.Reader.open hardcodes Zotero.getMainWindow() — the most recent
+		// navigator:browser — for its existing-tab lookup (reader.js:2700). With
+		// two main windows open, acting from a background one would open the tab
+		// in the other window. Refuse rather than surprise.
+		try {
+			if (win.Services && win.Services.focus
+				&& win.Services.focus.activeWindow
+				&& win.Services.focus.activeWindow !== win) {
+				Zotero.debug('[quick-switcher] ignoring activation from a non-active window');
+				this.close();
+				return;
+			}
+		}
+		catch (e) {}
+
+		// Close FIRST: Zotero_Tabs.select() snapshots document.activeElement and
+		// fires the type's refocus hook on setTimeout(…, 0) (tabs.js:911-916,
+		// 941-944), so anything focused after it is stolen a tick later.
 		this.close();
 
-		this._win.ZQS_Opener.openItem(entry.item).catch((e) => {
+		win.ZQS_Opener.openEntry(entry.entry, { reveal, background }).catch((e) => {
 			Zotero.logError(new Error('[quick-switcher] open failed: ' + e));
 		});
 	},

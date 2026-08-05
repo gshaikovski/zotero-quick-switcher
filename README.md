@@ -4,12 +4,21 @@ An Obsidian-style quick switcher for Zotero 9. Press **Cmd+O** from any tab — 
 PDF you're reading — type a few words, and jump straight to a paper.
 
 - Overlay search bar, available from any tab
-- Results ranked by relevance as you type, 10 visible, scrolls past 10
+- Fuzzy, relevance-ranked results as you type; 10 visible, scrolls past 10
 - First result preselected; arrow keys move the selection (wrapping at the ends)
-- **Enter** opens the paper in a new tab, or switches to its tab if it's already open
-- **Esc** dismisses
+- **Enter** opens the paper in a tab, or switches to its tab if it's already open
 
 Rows already open in a tab are badged `open`.
+
+| Key | Action |
+|---|---|
+| `Cmd+O` | Open / close the switcher |
+| `↑` `↓` | Move the selection (wraps) |
+| `Home` `End` | Jump to first / last result |
+| `Enter` | Open the paper in a reader tab, or switch to its existing tab |
+| `Shift+Enter` | Reveal the item in the library tab instead |
+| `Cmd+Enter` | Open the tab in the background, without focusing it |
+| `Esc` | Dismiss |
 
 ## Install
 
@@ -31,62 +40,76 @@ Press **Cmd+O** to open the switcher.
 Installing from a file avoids two traps that make the "drop a proxy file in the profile" workflow
 fail silently — see [Development install](#development-install) if you want that route anyway.
 
-## Changing the hotkey
+## Preferences
 
-The hotkey is a preference, not hardcoded. In **Advanced → Config Editor**, edit:
+Both live in **Advanced → Config Editor**. Restart Zotero (or disable/re-enable the plugin) after
+changing either.
 
-```
-extensions.quickswitcher.hotkey
-```
+**`extensions.quickswitcher.hotkey`** — default `accel+O`. Modifiers joined by `+`, then the key:
+`accel+O`, `accel+shift+P`, `alt+space`. `accel` is Cmd on macOS, Ctrl elsewhere.
 
-Format is modifiers joined by `+`, then the key — e.g. `accel+O`, `accel+shift+P`, `alt+space`.
-`accel` means Cmd on macOS and Ctrl elsewhere. Restart Zotero (or disable/re-enable the plugin)
-after changing it.
+`accel+O` is the default because it's genuinely unclaimed in Zotero 9: not in any main-window
+keyset, not one of the `extensions.zotero.keys.*` shortcuts (those all require accel+**shift**), and
+not in the PDF reader's own key table. Note `Cmd+Shift+O` *is* taken (New Note) and `Cmd+Shift+K` is
+taken (focus quick search), so avoid those.
 
-`accel+O` is the default because it's genuinely unclaimed in Zotero 9: it isn't in any main-window
-keyset, isn't one of the `extensions.zotero.keys.*` shortcuts (those all require accel+**shift**),
-and isn't in the PDF reader's own key table. Note that `Cmd+Shift+O` *is* taken (New Note) and
-`Cmd+Shift+K` is taken (focus quick search), so avoid those.
+**`extensions.quickswitcher.alwaysOpenInZoteroTab`** — default `true`. Enter always opens the paper
+in a Zotero reader tab. Set it to `false` to defer to Zotero's own file-handler preferences instead,
+so a paper opens in whatever external app you configured under *Settings → General → "Open PDFs
+using"* — matching double-click behaviour, but meaning Enter may not produce a tab at all.
 
 ## How it works
 
 Zotero's search returns matching item IDs with **no relevance score and no ordering** — there's no
-`ORDER BY` anywhere in `search.js`. So the plugin splits the work:
+`ORDER BY` anywhere in `search.js`. Ranking has to happen client-side regardless, and once you're
+ranking client-side, `Zotero.Search` costs more than it gives: its `contains` operator compiles to
+SQL `LIKE '%token%'`, so a candidate must contain every token as a literal substring. That makes
+fuzzy matching impossible — `aiayn` could never reach the ranker.
 
-1. **Narrowing (SQLite).** `src/engine.js` runs the same `quicksearch-titleCreatorYear` condition
-   Zotero's own search box uses. It tokenises the query, ORs each token across
-   title / publicationTitle / shortTitle / court / year / citationKey / creator, ANDs the tokens
-   together, and excludes child notes and attachments.
-2. **Ranking (JS).** Results are then scored here. Per token, per field, strongest match wins:
-   exact field > field prefix > word-start prefix > substring > subsequence. Title outweighs
-   creators, which outweigh year and publication. Whole-query bonuses push an exact or
-   prefix title match to the top, and a mild brevity preference keeps a short precise title above a
-   long one containing the same words. Ties break on most-recently-modified.
+So the plugin keeps its own index instead:
 
-`src/opener.js` resolves the selected paper to the attachment that actually opens
-(`getBestAttachment()`), then calls `Zotero.Reader.open()`. That call already does its own
-already-open detection, so "switch to the existing tab" is Zotero's behavior, not a reimplementation
-of it. Papers with no openable attachment fall back to Zotero's own url/DOI handling, and finally to
-revealing the item in the library tab — so Enter always does something visible.
+1. **Index** (`src/engine.js`). Built once at startup from `Zotero.Items.getAll()` per library, and
+   rebuilt when the Notifier reports item changes. For each paper it stores lowercased title,
+   title initials, short title, creators (in *both* name orders), year, venue and citation key —
+   plus the id of the attachment that would open, resolved synchronously so the `open` badge needs
+   no async work per row.
+2. **Rank.** Per token, per field, strongest match wins: exact > prefix > word-start > substring >
+   subsequence. Title outweighs creators, which outweigh venue and year. Whole-query bonuses push an
+   exact or prefix title match to the top, and a mild brevity preference keeps a short precise title
+   above a long one containing the same words. Every token must match something, so multi-word
+   queries narrow rather than broaden. Ties break on most-recently-modified.
 
-`src/overlay.js` builds the UI as a XUL `<panel>`, the same primitive Zotero uses for its tabs menu.
-A panel renders in its own popup layer, which is what makes it reliably paint *above* a PDF reader
-tab; an absolutely-positioned `<div>` sharing the stack with the reader's `<browser>` is not
-dependable for that. The hotkey is a **capture-phase** `keydown` listener on the chrome document —
-the same mechanism Zotero itself uses to make Cmd+W close a reader tab while the PDF has focus.
+That yields the fuzzy behaviour you'd expect: `attention`, `attention need`, `atten`, `aiayn` and
+`atnisallyn` all find *Attention Is All You Need*.
+
+`src/opener.js` resolves the paper to its reader-openable attachment and calls
+`Zotero.Reader.open()`, which **already does its own already-open detection** — it selects the
+existing tab, loaded or unloaded, rather than duplicating it. So "switch to the existing tab" is
+Zotero's own behaviour, not a reimplementation. Papers with no openable attachment fall back to
+Zotero's url/DOI handling, and finally to revealing the item in the library, so Enter always does
+something visible.
+
+`src/overlay.js` builds the UI as a `position: fixed` XHTML div appended to `documentElement` —
+the same construct as Zotero's `#zotero-tab-cover`, which demonstrably paints over a PDF reader. A
+XUL `<panel>` was the other candidate and was rejected: it hijacks Escape (Zotero's own source
+comments on having to work around this), and on macOS it's a separate native window whose hide
+races the focus hook that runs when tabs switch.
+
+The hotkey is a **capture-phase** `keydown` listener on the chrome window. The reader is an
+in-process, non-remote `<browser>`, so its key events travel through the chrome window, and capture
+runs before the reader's own handler can swallow the combo. This is the same mechanism Zotero uses
+to make Cmd+W close a reader tab while the PDF has focus.
 
 ## Known limitations
 
-- **Matching is per-word substring, not true fuzzy.** Typing `attention need` or `atten` finds
-  "Attention Is All You Need"; typing `aiayn` does not. This is a consequence of stage 1: Zotero's
-  SQL filter uses `LIKE '%token%'`, so a subsequence-only candidate never reaches the ranker. Real
-  fuzzy matching would need a client-side index of the whole library. The ranker already contains a
-  subsequence scorer for when that changes.
-- **Minimum query length is 2 characters.** A single character matches almost everything.
-- **Very broad queries are capped** at 5000 candidates before ranking, and the status line says
-  `narrowed` when that happens.
-- A reader opened in its *own window* (rather than a tab) doesn't get the overlay — that window is a
-  separate window type and never receives `onMainWindowLoad`.
+- A reader opened in its **own window** (rather than a tab) doesn't get the overlay — that's a
+  separate window type which never receives `onMainWindowLoad`.
+- If a paper is already open in a reader *window* rather than a tab, Enter matches that window and
+  no tab appears, so nothing visibly happens in the main window.
+- With two main windows open, activation is ignored in the non-focused one: `Zotero.Reader.open`
+  hardcodes the most-recent window, so acting from a background window would open the tab somewhere
+  unexpected.
+- Feeds are excluded from the index — this is a switcher for papers.
 
 ## Development install
 
@@ -123,10 +146,10 @@ and a `strict_max_version` that covers your Zotero version.
 ```
 manifest.json           plugin metadata (manifest_version 2, applications.zotero)
 bootstrap.js            lifecycle hooks; attaches/detaches per main window
-prefs.js                default hotkey pref
-src/engine.js           Zotero.Search narrowing + relevance ranking
+prefs.js                default prefs (hotkey, open-in-tab behaviour)
+src/engine.js           in-memory index + fuzzy relevance ranking
 src/opener.js           item -> attachment -> tab, incl. already-open switching
-src/overlay.js          the panel UI, hotkey capture, keyboard navigation
+src/overlay.js          the overlay UI, hotkey capture, keyboard navigation
 skin/quickSwitcher.css  theme-aware styling via Zotero's CSS variables
 build.sh                packages the .xpi
 ```
@@ -134,5 +157,9 @@ build.sh                packages the .xpi
 ## Status
 
 Written against Zotero **9.0.6** (Gecko 140 ESR), with every API call verified against the shipped
-source in `omni.ja` rather than from documentation. `strict_min_version` is set to `7.0`, but it has
-only been checked against 9.0.6.
+source in `omni.ja` rather than from documentation — most public Zotero plugin advice targets the
+Zotero 6 overlay architecture and is wrong for 7+.
+
+`SPEC.md` is the implementation spec derived from that source reading. `REVIEW-FINDINGS.md` records
+an adversarial review pass. `strict_min_version` is set to `7.0`, but this has only been checked
+against 9.0.6.
