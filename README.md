@@ -100,6 +100,19 @@ in-process, non-remote `<browser>`, so its key events travel through the chrome 
 runs before the reader's own handler can swallow the combo. This is the same mechanism Zotero uses
 to make Cmd+W close a reader tab while the PDF has focus.
 
+## Tests
+
+```sh
+./test/run.sh
+```
+
+The harnesses execute `src/engine.js` and `src/overlay.js` in Node against stubbed Zotero and DOM
+objects. They need no Zotero install and never touch your profile. They cover ranking behaviour
+(including the fuzzy and acronym cases), quote/apostrophe handling, hotkey matching across keyboard
+layouts, and the overlay state machine — specifically the races an earlier review pass caught:
+a dismissed query rendering into a reopened switcher, teardown during an in-flight search, and a
+click on a stale row opening the wrong paper.
+
 ## Known limitations
 
 - A reader opened in its **own window** (rather than a tab) doesn't get the overlay — that's a

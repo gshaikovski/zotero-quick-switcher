@@ -39,9 +39,6 @@ var ZQS_Engine = {
 		citationKey: 0.5,
 	},
 
-	/** Above this many entries, cheap-prefilter before full scoring. */
-	PREFILTER_THRESHOLD: 20000,
-
 	_win: null,
 	_entries: [],
 	_building: null,
@@ -204,7 +201,7 @@ var ZQS_Engine = {
 		const shortTitle = get('shortTitle');
 		const citationKey = get('citationKey');
 
-		const titleLower = title.toLowerCase();
+		const titleLower = this.normalize(title);
 
 		return {
 			id: item.id,
@@ -216,11 +213,11 @@ var ZQS_Engine = {
 			l: {
 				title: titleLower,
 				initials: this._initials(titleLower),
-				shortTitle: shortTitle.toLowerCase(),
-				creators: creators.toLowerCase(),
-				year: year.toLowerCase(),
-				publication: publication.toLowerCase(),
-				citationKey: citationKey.toLowerCase(),
+				shortTitle: this.normalize(shortTitle),
+				creators: this.normalize(creators),
+				year: this.normalize(year),
+				publication: this.normalize(publication),
+				citationKey: this.normalize(citationKey),
 			},
 			attachmentID: this._pickReaderAttachment(item),
 			dateModified: (() => {
@@ -298,9 +295,29 @@ var ZQS_Engine = {
 	 * ---------------------------------------------------------------- */
 
 	/**
-	 * Tokenise a query. Splits on whitespace, keeps "quoted phrases" whole, and
-	 * strips stray quote characters so a half-typed phrase can't produce a token
-	 * that matches nothing.
+	 * Normalise text for matching: lowercase, fold curly quotes onto straight
+	 * ones, and NFC-normalise. Applied to BOTH the index and the query, so a
+	 * title containing a typographic apostrophe still matches a typed one.
+	 */
+	normalize(s) {
+		let out = (s || '').toString().toLowerCase()
+			.replace(/[‘’ʼ′]/g, "'")
+			.replace(/[“”″]/g, '"');
+		try {
+			out = out.normalize('NFC');
+		}
+		catch (e) {}
+		return out;
+	},
+
+	/**
+	 * Tokenise a query. Splits on whitespace and keeps "quoted phrases" whole.
+	 *
+	 * Only LEADING/TRAILING quotes are stripped, never interior ones: stripping
+	 * every quote would turn "O'Brien" into "obrien" and "don't" into "dont",
+	 * neither of which appears in the index, so those queries would match
+	 * nothing while a half-typed phrase like `"attention` still needs its stray
+	 * opening quote removed.
 	 */
 	tokenize(query) {
 		const tokens = [];
@@ -308,7 +325,7 @@ var ZQS_Engine = {
 		let m;
 		while ((m = re.exec(query)) !== null) {
 			const raw = m[1] !== undefined ? m[1] : m[2];
-			const text = raw.replace(/["']/g, '').trim().toLowerCase();
+			const text = this.normalize(raw).replace(/^["']+|["']+$/g, '').trim();
 			if (text) tokens.push(text);
 		}
 		return tokens;
@@ -386,7 +403,7 @@ var ZQS_Engine = {
 
 		// Whole-query bonuses: what makes the obviously-right paper sit first
 		// rather than merely appear somewhere in the list.
-		const q = rawQuery.trim().toLowerCase();
+		const q = this.normalize(rawQuery).trim();
 		if (q) {
 			if (l.title === q) score += 0.60;
 			else if (l.title.startsWith(q)) score += 0.30;
@@ -414,18 +431,13 @@ var ZQS_Engine = {
 
 		const entries = await this.ensureIndex();
 
-		// For very large libraries, drop obvious non-matches with a cheap
-		// substring/subsequence check on the title before full scoring.
-		let candidates = entries;
-		if (entries.length > this.PREFILTER_THRESHOLD) {
-			const first = tokens[0];
-			candidates = entries.filter(e => e.l.title.includes(first)
-				|| e.l.creators.includes(first)
-				|| e.l.initials.startsWith(first));
-		}
-
+		// Deliberately NO prefilter. A cheap substring prefilter would silently
+		// drop subsequence-only matches — exactly the fuzzy queries this index
+		// exists to support — and would reintroduce the "results depend on how
+		// big your library is" failure mode. Scoring is a handful of indexOf
+		// calls per entry; the debounce absorbs it.
 		const scored = [];
-		for (const entry of candidates) {
+		for (const entry of entries) {
 			let score = 0;
 			try {
 				score = this.scoreEntry(entry, tokens, trimmed);

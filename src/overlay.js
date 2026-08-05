@@ -131,6 +131,20 @@ var ZQS_Overlay = {
 	 * Hotkey
 	 * ---------------------------------------------------------------- */
 
+	/**
+	 * Names the user can write in the pref that don't equal the KeyboardEvent
+	 * key value they produce. Without these, a documented spec like "alt+space"
+	 * silently never fires, because event.key for the spacebar is " ".
+	 */
+	KEY_ALIASES: {
+		space: ' ', spacebar: ' ',
+		enter: 'enter', return: 'enter',
+		esc: 'escape',
+		up: 'arrowup', down: 'arrowdown', left: 'arrowleft', right: 'arrowright',
+		comma: ',', period: '.', dot: '.', slash: '/', backslash: '\\',
+		semicolon: ';', quote: "'", backtick: '`', minus: '-', equals: '=',
+	},
+
 	_readHotkeyPref() {
 		let spec = 'accel+O';
 		try {
@@ -140,10 +154,17 @@ var ZQS_Overlay = {
 		catch (e) {}
 
 		const parts = spec.split('+').map(p => p.trim().toLowerCase()).filter(Boolean);
-		const key = parts.pop() || 'o';
+		let key = parts.pop() || 'o';
+		if (Object.prototype.hasOwnProperty.call(this.KEY_ALIASES, key)) {
+			key = this.KEY_ALIASES[key];
+		}
 		const mods = new Set(parts);
+
 		return {
 			key,
+			// Physical-position fallback, but only for plain letters/digits.
+			codeFallback: /^[a-z]$/.test(key) ? 'key' + key
+				: (/^[0-9]$/.test(key) ? 'digit' + key : null),
 			accel: mods.has('accel'),
 			ctrl: mods.has('ctrl') || mods.has('control'),
 			meta: mods.has('meta') || mods.has('cmd') || mods.has('command'),
@@ -156,11 +177,17 @@ var ZQS_Overlay = {
 		const hk = this._hotkey;
 		if (!hk) return false;
 
-		// event.code is layout-independent; event.key is uppercased when Shift
-		// is held. Accept either so the binding survives odd layouts.
 		const key = (event.key || '').toLowerCase();
-		const code = (event.code || '').toLowerCase();
-		if (key !== hk.key && code !== 'key' + hk.key) return false;
+		let match = key === hk.key;
+
+		// Fall back to the physical key position only when the layout produced
+		// something that isn't a plain character — otherwise an alternate layout
+		// (Dvorak etc.) would bind BOTH the key labelled O and whatever sits at
+		// QWERTY's O position, which is not what anyone asked for.
+		if (!match && hk.codeFallback && !/^[a-z0-9]$/.test(key)) {
+			match = (event.code || '').toLowerCase() === hk.codeFallback;
+		}
+		if (!match) return false;
 
 		const wantCtrl = hk.ctrl || (hk.accel && !Zotero.isMac);
 		const wantMeta = hk.meta || (hk.accel && Zotero.isMac);
@@ -612,8 +639,9 @@ var ZQS_Overlay = {
 	 * ---------------------------------------------------------------- */
 
 	_activate({ reveal = false, background = false } = {}) {
-		const entry = this._results[this._selectedIndex];
-		if (!entry) return;
+		// _results holds { entry, score } wrappers; the opener wants the entry.
+		const selected = this._results[this._selectedIndex];
+		if (!selected || !selected.entry) return;
 
 		const win = this._win;
 
@@ -637,7 +665,7 @@ var ZQS_Overlay = {
 		// 941-944), so anything focused after it is stolen a tick later.
 		this.close();
 
-		win.ZQS_Opener.openEntry(entry.entry, { reveal, background }).catch((e) => {
+		win.ZQS_Opener.openEntry(selected.entry, { reveal, background }).catch((e) => {
 			Zotero.logError(new Error('[quick-switcher] open failed: ' + e));
 		});
 	},
