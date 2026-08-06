@@ -41,18 +41,13 @@ something looks wrong, **Help → Debug Output Logging → View Output** and loo
   was cut short by a session limit, so 13 findings are unadjudicated; each was assessed by hand
   before deciding whether to act.
 
-Both passes are folded in. What was deliberately **not** fixed, with reasons:
+- `REVIEW-AUDIT.md` — the disposition of **all 34** pass-2 findings: fixed, verified-no-change, or
+  deliberately deferred with a reason. Written so the coverage claim is checkable rather than
+  asserted, since 13 of them never got a skeptic verdict before the session limit hit.
 
-- **Per-window index duplication.** With N main windows open you get N copies of the index and N
-  rebuilds per item change. Correct but wasteful; irrelevant at one window, and hoisting it to a
-  singleton is a real refactor.
-- **`waitForDataLoad('item')` at attach time** force-loads item data Zotero defers. It is what makes
-  the first Cmd+O instant. Revisit if startup feels slow.
-- **`_pickReaderAttachment` omits the parent-URL tiebreak** from Zotero's `getBestAttachments`
-  ordering, so on an item with several PDFs it can pick a different one than double-click would.
-  Rare, and the sync resolution it buys is what keeps the "already open" badge cheap.
-- **Popped-out reader windows** get no overlay — a separate window type that never receives
-  `onMainWindowLoad`. Documented in the README.
+Both passes are folded in. Five findings were deliberately deferred; see the audit for each. The
+one behavioural gap worth knowing up front: **popped-out reader windows** get no overlay, because
+that is a separate window type which never receives `onMainWindowLoad`.
 
 ## Ground truth
 

@@ -22,8 +22,19 @@ var rootURI = null;
 // (plugins.js:133-135 — _loadScope early-returns when the scope already
 // exists), so module-level state survives. Everything is therefore
 // (re)initialised in startup() and fully torn down in shutdown().
-var attachedWindows = new Set();
+//
+// windowState is keyed by window and holds teardown data we own OURSELVES,
+// rather than reaching through win.ZQS_* at teardown time. That matters
+// because a window can be torn down far enough that its globals are gone
+// while our Notifier observers — which are registered against the Zotero
+// singleton, not the window — are still very much alive. Keeping the ids here
+// means we can always unregister them.
+var windowState = new Map();
 var pendingWindows = new Set();
+
+// Bumped by shutdown(). An attach that was awaiting when shutdown ran checks
+// this and aborts instead of installing itself into a dead plugin.
+var generation = 0;
 
 const MODULES = [
 	'src/engine.js',
@@ -47,24 +58,62 @@ function isWindowReady(win) {
 }
 
 async function attachToWindow(win) {
-	if (!win || attachedWindows.has(win) || pendingWindows.has(win)) return;
+	if (!rootURI) return; // shut down, or not started yet
+	if (!win || windowState.has(win) || pendingWindows.has(win)) return;
 
 	if (!isWindowReady(win)) {
-		win.addEventListener('load', () => {
+		// Track the listener so shutdown can remove it. Left untracked, it
+		// fires after teardown, when rootURI is null, and tries to load
+		// "nullsrc/engine.js".
+		const onLoad = () => {
+			const state = windowState.get(win);
+			if (state) state.onLoad = null;
 			attachToWindow(win).catch((e) => {
 				Zotero.logError(new Error('[quick-switcher] deferred attach failed: ' + e));
 			});
-		}, { once: true });
+		};
+		windowState.set(win, { onLoad, notifierIDs: [], attached: false });
+		win.addEventListener('load', onLoad, { once: true });
 		return;
 	}
 
+	const gen = generation;
 	pendingWindows.add(win);
 	try {
 		for (const path of MODULES) {
 			Services.scriptloader.loadSubScript(rootURI + path, win);
 		}
-		await win.ZQS_Overlay.init(win, rootURI);
-		attachedWindows.add(win);
+		const handles = await win.ZQS_Overlay.init(win, rootURI);
+
+		// shutdown() ran while we were awaiting — undo rather than install.
+		if (gen !== generation) {
+			try {
+				win.ZQS_Overlay.destroy();
+			}
+			catch (e) {}
+			for (const name of MODULE_GLOBALS) {
+				try {
+					win[name] = undefined;
+				}
+				catch (ignored) {}
+			}
+			windowState.delete(win);
+			log('attach aborted — plugin shut down mid-attach');
+			return;
+		}
+
+		const prev = windowState.get(win) || {};
+		windowState.set(win, {
+			onLoad: null,
+			notifierIDs: (handles && handles.notifierIDs) || [],
+			attached: true,
+		});
+		if (prev.onLoad) {
+			try {
+				win.removeEventListener('load', prev.onLoad);
+			}
+			catch (e) {}
+		}
 		log('attached to main window');
 	}
 	catch (e) {
@@ -84,6 +133,17 @@ async function attachToWindow(win) {
 
 function detachFromWindow(win) {
 	if (!win) return;
+	const state = windowState.get(win);
+
+	// Remove a pending 'load' listener before anything else — if the window
+	// never became ready, this is the only thing we ever registered.
+	if (state && state.onLoad) {
+		try {
+			win.removeEventListener('load', state.onLoad);
+		}
+		catch (e) {}
+	}
+
 	try {
 		if (win.ZQS_Overlay && typeof win.ZQS_Overlay.destroy === 'function') {
 			win.ZQS_Overlay.destroy();
@@ -93,6 +153,18 @@ function detachFromWindow(win) {
 		Zotero.logError(new Error('[quick-switcher] overlay teardown failed: ' + e));
 	}
 
+	// Unregister from our own records too. If the window died before we could
+	// reach its globals above, this is what stops the observers — which live on
+	// the Zotero singleton — from leaking for the rest of the session.
+	if (state && state.notifierIDs) {
+		for (const id of state.notifierIDs) {
+			try {
+				Zotero.Notifier.unregisterObserver(id);
+			}
+			catch (e) {}
+		}
+	}
+
 	for (const name of MODULE_GLOBALS) {
 		try {
 			win[name] = undefined;
@@ -100,7 +172,7 @@ function detachFromWindow(win) {
 		catch (ignored) {}
 	}
 
-	attachedWindows.delete(win);
+	windowState.delete(win);
 	log('detached from main window');
 }
 
@@ -117,9 +189,20 @@ function install(params, reason) {}
 
 // eslint-disable-next-line no-unused-vars
 async function startup({ rootURI: root }, reason) {
-	rootURI = root; // always ends with '/'
-	attachedWindows = new Set();
+	// Detach anything a previous startup left behind. bootstrap.js is not
+	// re-evaluated on disable -> enable, so windowState can still hold live
+	// entries here; discarding the Map without tearing them down would leak
+	// every listener and observer from the previous run.
+	for (const win of [...windowState.keys()]) {
+		try {
+			detachFromWindow(win);
+		}
+		catch (e) {}
+	}
+	windowState = new Map();
 	pendingWindows = new Set();
+
+	rootURI = root; // always ends with '/'
 
 	// Plugins.init() runs after Zotero.initializationDeferred.resolve(), so
 	// Zotero is already initialised — but await it explicitly, since the item
@@ -150,12 +233,15 @@ function onMainWindowUnload({ window: win }, reason) {
 
 // eslint-disable-next-line no-unused-vars
 function shutdown(params, reason) {
-	for (const win of [...attachedWindows]) {
+	// Invalidate in-flight attaches before tearing anything down.
+	generation++;
+	rootURI = null;
+
+	for (const win of [...windowState.keys()]) {
 		detachFromWindow(win);
 	}
-	attachedWindows = new Set();
+	windowState = new Map();
 	pendingWindows = new Set();
-	rootURI = null;
 }
 
 // eslint-disable-next-line no-unused-vars

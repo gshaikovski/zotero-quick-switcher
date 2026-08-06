@@ -110,13 +110,16 @@
 
 #zqs-overlay .zqs-row {
 	box-sizing: border-box;
-	height: var(--zqs-row-h);
+	/* min-height rather than height: at Zotero's larger UI font settings a
+	   hard 52px clips the second line. Rows grow instead, which means "10
+	   visible" becomes approximate at large fonts — the right trade against
+	   unreadable text. */
+	min-height: var(--zqs-row-h);
 	display: flex;
 	align-items: center;
 	gap: 10px;
-	padding: 0 16px;
+	padding: 4px 16px;
 	cursor: default;
-	/* Fixed height means long titles must not wrap. */
 	overflow: hidden;
 }
 

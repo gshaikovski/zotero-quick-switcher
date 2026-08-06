@@ -15,8 +15,10 @@
 var ZQS_Opener = {
 	_win: null,
 
+	/** @returns {null} no Notifier observer of its own; kept for symmetry */
 	init(win) {
 		this._win = win;
+		return null;
 	},
 
 	destroy() {
@@ -167,20 +169,30 @@ var ZQS_Opener = {
 		return false;
 	},
 
+	/**
+	 * Would ZoteroPane.viewItems find something to launch?
+	 *
+	 * Deliberately mirrors its exact chain (zoteroPane.js:5044-5068): the item's
+	 * url, then its DOI, then the url of the FIRST attachment only. Scanning
+	 * every attachment here would be more generous than viewItems actually is,
+	 * so the gate would open, viewItems would silently do nothing, and Enter
+	 * would appear dead instead of falling through to revealing the item.
+	 */
 	_hasLaunchableURL(item) {
 		try {
 			if (item.getField('url')) return true;
 			const doi = item.getField('DOI');
 			if (doi && Zotero.Utilities.cleanDOI(doi)) return true;
-			for (const id of item.getAttachments()) {
-				let att;
+			const ids = item.getAttachments();
+			if (ids && ids.length) {
+				let first;
 				try {
-					att = Zotero.Items.get(id);
+					first = Zotero.Items.get(ids[0]);
 				}
 				catch (e) {
-					continue;
+					first = null;
 				}
-				if (att && att.getField('url')) return true;
+				if (first && first.getField('url')) return true;
 			}
 		}
 		catch (e) {}

@@ -52,6 +52,7 @@ var ZQS_Overlay = {
 	_visible: false,
 	_lastPointer: null,
 	_prevFocus: null,
+	_initGen: 0,
 
 	_onKeyDownCapture: null,
 	_onWindowDeactivate: null,
@@ -60,36 +61,64 @@ var ZQS_Overlay = {
 	 * Lifecycle
 	 * ---------------------------------------------------------------- */
 
+	/**
+	 * @returns {Promise<{notifierIDs: String[]}>} handles bootstrap tracks, so
+	 *   teardown works even if the window is gone by then.
+	 */
 	async init(win, rootURI) {
+		// Idempotent: a second init() would otherwise register a second pair of
+		// window listeners that destroy() could never remove.
+		if (this._win) this.destroy();
+
 		this._win = win;
 		this._doc = win.document;
 		this._rootURI = rootURI;
 
-		win.ZQS_Engine.init(win);
-		win.ZQS_Opener.init(win);
+		const notifierIDs = [
+			win.ZQS_Engine.init(win),
+			win.ZQS_Opener.init(win),
+		].filter(Boolean);
 
 		this._hotkey = this._readHotkeyPref();
-		await this._injectStylesheet();
-		this._buildDOM();
 
+		// Listeners go on BEFORE the stylesheet await. Registering after would
+		// leave a window that got destroy()d mid-await with a live <style> and
+		// no way to reach it.
 		this._onKeyDownCapture = this._handleKeyDownCapture.bind(this);
 		win.addEventListener('keydown', this._onKeyDownCapture, true);
-
 		this._onWindowDeactivate = () => this.close();
 		win.addEventListener('deactivate', this._onWindowDeactivate);
+
+		const gen = ++this._initGen;
+		await this._injectStylesheet();
+		// destroy() ran while we were reading the stylesheet off disk.
+		if (gen !== this._initGen || !this._win) {
+			try {
+				if (this._style) this._style.remove();
+			}
+			catch (e) {}
+			this._style = null;
+			return { notifierIDs };
+		}
+
+		this._buildDOM();
 
 		// Warm the index in the background so the first Cmd+O is instant.
 		win.ZQS_Engine.ensureIndex().catch((e) => {
 			Zotero.debug('[quick-switcher] initial index build failed: ' + e);
 		});
+
+		return { notifierIDs };
 	},
 
 	destroy() {
 		const win = this._win;
 
 		// Invalidate anything in flight BEFORE nulling fields, so a suspended
-		// _runSearch cannot resume and dereference a null _doc.
+		// _runSearch — or an init() awaiting the stylesheet — cannot resume and
+		// dereference a null _doc.
 		this._searchSeq++;
+		this._initGen++;
 		this._visible = false;
 
 		if (this._debounceTimer && win) {
@@ -290,7 +319,23 @@ var ZQS_Overlay = {
 		}
 		catch (e) {
 			Zotero.logError(new Error('[quick-switcher] could not read stylesheet: ' + e));
-			return;
+			// Without CSS the overlay is a full-bleed unstyled div covering the
+			// whole window with no way to see or dismiss it — far worse than
+			// not having the feature. This minimal sheet keeps it usable and
+			// dismissable; the plugin is degraded but not destructive.
+			css = '#zqs-overlay{position:fixed;inset:0;z-index:2147483000;'
+				+ 'display:flex;flex-direction:column;align-items:center;padding-top:12vh}'
+				+ '#zqs-overlay[hidden]{display:none}'
+				+ '#zqs-overlay .zqs-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.32)}'
+				+ '#zqs-overlay .zqs-modal{position:relative;width:640px;max-width:92vw;'
+				+ 'max-height:76vh;overflow:hidden;background:Menu;color:MenuText;'
+				+ 'border:1px solid ThreeDShadow;border-radius:10px}'
+				+ '#zqs-overlay .zqs-input{width:100%;box-sizing:border-box;padding:14px 16px;'
+				+ 'border:0;background:transparent;color:inherit;font-size:1.25em}'
+				+ '#zqs-overlay .zqs-list{max-height:520px;overflow-y:auto}'
+				+ '#zqs-overlay .zqs-row{display:flex;align-items:center;gap:10px;padding:8px 16px}'
+				+ '#zqs-overlay .zqs-row.selected{background:Highlight;color:HighlightText}'
+				+ '#zqs-overlay .zqs-status{padding:8px 16px;font-size:.82em}';
 		}
 
 		const style = doc.createElement('style');

@@ -39,17 +39,38 @@ var ZQS_Engine = {
 		citationKey: 0.5,
 	},
 
+	/**
+	 * Don't re-scan the library more often than this. A sync or a big import
+	 * fires item notifications continuously, and without a floor every
+	 * keystroke would trigger a fresh full scan and stall typing for its
+	 * duration. In between, searches run against the slightly stale index —
+	 * which is the right trade for a switcher.
+	 */
+	REBUILD_MIN_INTERVAL_MS: 2000,
+
 	_win: null,
 	_entries: [],
 	_building: null,
 	_dirty: true,
+	_lastBuilt: 0,
 	_notifierID: null,
 
+	/** @returns {String|null} the Notifier observer id, for bootstrap to track */
 	init(win) {
+		// Idempotent: a second init() must not strand the first observer.
+		if (this._notifierID) {
+			try {
+				Zotero.Notifier.unregisterObserver(this._notifierID);
+			}
+			catch (e) {}
+			this._notifierID = null;
+		}
+
 		this._win = win;
 		this._entries = [];
 		this._dirty = true;
 		this._building = null;
+		this._lastBuilt = 0;
 
 		this._notifierID = Zotero.Notifier.registerObserver({
 			notify: (event, type) => {
@@ -62,6 +83,8 @@ var ZQS_Engine = {
 				}
 			},
 		}, ['item'], 'quick-switcher-index');
+
+		return this._notifierID;
 	},
 
 	destroy() {
@@ -75,6 +98,7 @@ var ZQS_Engine = {
 		this._entries = [];
 		this._building = null;
 		this._dirty = true;
+		this._lastBuilt = 0;
 		this._win = null;
 	},
 
@@ -89,6 +113,12 @@ var ZQS_Engine = {
 		// stale _entries array instead of awaiting the new one.
 		if (this._building) return this._building;
 		if (!this._dirty) return this._entries;
+
+		// Rate-limit rebuilds, but only once we have something to serve.
+		if (this._lastBuilt
+			&& (Date.now() - this._lastBuilt) < this.REBUILD_MIN_INTERVAL_MS) {
+			return this._entries;
+		}
 
 		this._building = (async () => {
 			// Cleared up front, not at the end: an item change arriving mid-scan
@@ -129,6 +159,7 @@ var ZQS_Engine = {
 			}
 
 			this._entries = entries;
+			this._lastBuilt = Date.now();
 			Zotero.debug('[quick-switcher] indexed ' + entries.length + ' items');
 			return entries;
 		})();
