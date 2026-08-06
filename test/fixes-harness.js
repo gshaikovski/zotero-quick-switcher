@@ -47,8 +47,12 @@ E._dirty = false;
 	const q = async (query) => (await E.search(query)).results.map(r => r.entry.id);
 
 	console.log('--- tokenize / apostrophes ---');
-	check("tokenize keeps interior apostrophe", JSON.stringify(E.tokenize("don't")) === '["don\'t"]',
+	// Apostrophes are dropped on BOTH sides, so "don't"/"dont"/"don’t" all
+	// collapse to one form instead of being three mutually unmatchable ones.
+	check("tokenize folds apostrophe away", JSON.stringify(E.tokenize("don't")) === '["dont"]',
 		JSON.stringify(E.tokenize("don't")));
+	check("apostrophe-free query matches apostrophe title",
+		(await q('dont')).includes(1), JSON.stringify(await q('dont')));
 	check("tokenize strips a stray leading quote", JSON.stringify(E.tokenize('"attention')) === '["attention"]',
 		JSON.stringify(E.tokenize('"attention')));
 	check("tokenize keeps a quoted phrase whole", JSON.stringify(E.tokenize('"deep learning" bert')) === '["deep learning","bert"]',

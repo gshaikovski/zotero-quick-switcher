@@ -18,7 +18,7 @@ Rows already open in a tab are badged `open`.
 | `Enter` | Open the paper in a reader tab, or switch to its existing tab |
 | `Shift+Enter` | Reveal the item in the library tab instead |
 | `Cmd+Enter` | Open the tab in the background, without focusing it |
-| `Esc` | Dismiss |
+| `Esc` | Dismiss, returning focus where it was |
 
 ## Install
 
@@ -107,11 +107,17 @@ to make Cmd+W close a reader tab while the PDF has focus.
 ```
 
 The harnesses execute `src/engine.js` and `src/overlay.js` in Node against stubbed Zotero and DOM
-objects. They need no Zotero install and never touch your profile. They cover ranking behaviour
-(including the fuzzy and acronym cases), quote/apostrophe handling, hotkey matching across keyboard
-layouts, and the overlay state machine — specifically the races an earlier review pass caught:
-a dismissed query rendering into a reopened switcher, teardown during an in-flight search, and a
-click on a stale row opening the wrong paper.
+objects. They need no Zotero install and never touch your profile. 55 assertions covering:
+
+- ranking, including the fuzzy and acronym cases (`aiayn` → *Attention Is All You Need*)
+- text normalisation — pasted citation titles ending in a period, `Last, First` author form,
+  parenthesised `(LeCun 2015)` citations, hyphenated queries, apostrophes, and diacritics
+  (`uber` finds *Über…*)
+- hotkey matching across keyboard layouts, including Dvorak and named keys like `alt+space`
+- the overlay state machine — a dismissed query rendering into a reopened switcher, teardown
+  during an in-flight search, a click on a stale row opening the wrong paper, and the synthesized
+  mousemove that could steal the keyboard selection
+- the index-rebuild race, where an item changing mid-scan must leave the index dirty
 
 ## Known limitations
 

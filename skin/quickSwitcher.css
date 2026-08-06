@@ -46,9 +46,16 @@
 	flex-direction: column;
 	width: var(--zqs-width);
 	max-width: 92vw;
+	/* Never taller than the window: without a budget, a short window
+	   flex-shrinks the modal and clips the list with no scrollbar, so arrowing
+	   past row N selects rows the user cannot see. */
+	max-height: 76vh;
+	min-height: 0;
 	overflow: hidden;
 
-	background: var(--material-menu, var(--color-menu, Menu));
+	/* --color-menu (not --material-menu): the material tokens are translucent,
+	   which lets the PDF page underneath bleed through the result list. */
+	background: var(--color-menu, Menu);
 	color: var(--fill-primary, MenuText);
 	border: 1px solid var(--color-border, ThreeDShadow);
 	border-radius: 10px;
@@ -86,6 +93,15 @@
 	overflow-y: auto;
 	overflow-x: hidden;
 	scrollbar-width: thin;
+	/* Allow the list, not the input or status bar, to absorb the squeeze when
+	   the modal hits its max-height. */
+	flex: 0 1 auto;
+	min-height: 0;
+}
+
+#zqs-overlay .zqs-input,
+#zqs-overlay .zqs-status {
+	flex: 0 0 auto;
 }
 
 #zqs-overlay .zqs-list:empty {

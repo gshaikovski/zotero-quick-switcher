@@ -84,10 +84,17 @@ var ZQS_Engine = {
 
 	/** Build (or rebuild) the index. Concurrent callers share one build. */
 	async ensureIndex() {
-		if (!this._dirty && this._entries.length) return this._entries;
+		// Check the in-flight build FIRST: during a rebuild _dirty is already
+		// false, so testing _dirty first would hand a concurrent search the
+		// stale _entries array instead of awaiting the new one.
 		if (this._building) return this._building;
+		if (!this._dirty) return this._entries;
 
 		this._building = (async () => {
+			// Cleared up front, not at the end: an item change arriving mid-scan
+			// must leave the index dirty so the next search rebuilds. Clearing
+			// afterwards silently swallowed every change made during the scan.
+			this._dirty = false;
 			const entries = [];
 			try {
 				for (const lib of Zotero.Libraries.getAll()) {
@@ -122,7 +129,6 @@ var ZQS_Engine = {
 			}
 
 			this._entries = entries;
-			this._dirty = false;
 			Zotero.debug('[quick-switcher] indexed ' + entries.length + ' items');
 			return entries;
 		})();
@@ -295,29 +301,44 @@ var ZQS_Engine = {
 	 * ---------------------------------------------------------------- */
 
 	/**
-	 * Normalise text for matching: lowercase, fold curly quotes onto straight
-	 * ones, and NFC-normalise. Applied to BOTH the index and the query, so a
-	 * title containing a typographic apostrophe still matches a typed one.
+	 * Normalise text for matching. Applied to BOTH the index and the query, so
+	 * the two agree by construction — that is the whole point, and the reason
+	 * punctuation is handled here rather than in tokenize().
+	 *
+	 *   - lowercase
+	 *   - strip diacritics, so "muller" finds "Müller" and "lecun" finds "LeCun"
+	 *   - drop apostrophes entirely, so "don't"/"dont" and "O'Brien"/"OBrien"
+	 *     collapse to one form instead of being three unmatchable variants
+	 *   - fold every other punctuation run to a single space
+	 *
+	 * That last rule is what stops a pasted citation title from matching
+	 * nothing: "…Learning." tokenises to "learning", not "learning.", which is
+	 * absent from every haystack and would otherwise reject the whole item.
 	 */
 	normalize(s) {
 		let out = (s || '').toString().toLowerCase()
-			.replace(/[‘’ʼ′]/g, "'")
+			.replace(/[‘’ʼ′`]/g, "'")
 			.replace(/[“”″]/g, '"');
 		try {
-			out = out.normalize('NFC');
+			// NFD splits an accented character into base + combining mark, so
+			// removing the marks leaves the plain ASCII letter behind.
+			out = out.normalize('NFD').replace(/[̀-ͯ]/g, '');
 		}
 		catch (e) {}
-		return out;
+		out = out
+			.replace(/['ʼ]/g, '')
+			.replace(/[^\p{L}\p{N}]+/gu, ' ');
+		return out.trim().replace(/\s+/g, ' ');
 	},
 
 	/**
 	 * Tokenise a query. Splits on whitespace and keeps "quoted phrases" whole.
 	 *
-	 * Only LEADING/TRAILING quotes are stripped, never interior ones: stripping
-	 * every quote would turn "O'Brien" into "obrien" and "don't" into "dont",
-	 * neither of which appears in the index, so those queries would match
-	 * nothing while a half-typed phrase like `"attention` still needs its stray
-	 * opening quote removed.
+	 * normalize() does all the punctuation work, so a token that was purely
+	 * punctuation ("-", "(", "&") normalises to '' and is dropped rather than
+	 * becoming a token that matches everything or nothing. A hyphenated word
+	 * becomes a two-word phrase token that must still appear contiguously,
+	 * which is the behaviour people expect from "graph-based".
 	 */
 	tokenize(query) {
 		const tokens = [];
@@ -325,7 +346,7 @@ var ZQS_Engine = {
 		let m;
 		while ((m = re.exec(query)) !== null) {
 			const raw = m[1] !== undefined ? m[1] : m[2];
-			const text = this.normalize(raw).replace(/^["']+|["']+$/g, '').trim();
+			const text = this.normalize(raw);
 			if (text) tokens.push(text);
 		}
 		return tokens;
@@ -395,7 +416,10 @@ var ZQS_Engine = {
 				W.citationKey * this.scoreToken(token, l.citationKey)
 			);
 			if (best <= 0) return 0; // this token matches nothing — reject the item
-			if (this.scoreToken(token, l.title) <= 0) allTokensInTitle = false;
+			// A weak subsequence hit is not "in the title" for bonus purposes —
+			// counting it handed the +0.12 to noise and withheld it from the
+			// paper the user actually meant. Require a substring-tier match.
+			if (this.scoreToken(token, l.title) < 0.5) allTokensInTitle = false;
 			total += best;
 		}
 

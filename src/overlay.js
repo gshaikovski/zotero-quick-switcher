@@ -51,6 +51,7 @@ var ZQS_Overlay = {
 	_hotkey: null,
 	_visible: false,
 	_lastPointer: null,
+	_prevFocus: null,
 
 	_onKeyDownCapture: null,
 	_onWindowDeactivate: null,
@@ -122,6 +123,7 @@ var ZQS_Overlay = {
 		}
 
 		this._root = this._backdrop = this._input = this._list = this._status = this._style = null;
+		this._prevFocus = null;
 		this._results = [];
 		this._win = this._doc = null;
 		this._onKeyDownCapture = this._onWindowDeactivate = null;
@@ -199,6 +201,10 @@ var ZQS_Overlay = {
 	},
 
 	_handleKeyDownCapture(event) {
+		// While an IME is composing, every keystroke belongs to the input method.
+		// Consuming Enter/Escape/arrows here makes CJK text impossible to type.
+		if (event.isComposing || event.keyCode === 229) return;
+
 		if (this._matchesHotkey(event)) {
 			event.preventDefault();
 			event.stopPropagation();
@@ -231,10 +237,13 @@ var ZQS_Overlay = {
 				this._move(-1);
 				break;
 			case 'Home':
+				// Shift/Alt+Home is text selection inside the input; leave it.
+				if (event.shiftKey || event.altKey) break;
 				consume();
 				this._select(0);
 				break;
 			case 'End':
+				if (event.shiftKey || event.altKey) break;
 				consume();
 				this._select(this._results.length - 1);
 				break;
@@ -244,6 +253,13 @@ var ZQS_Overlay = {
 					reveal: event.shiftKey,
 					background: Zotero.isMac ? event.metaKey : event.ctrlKey,
 				});
+				break;
+			case 'Tab':
+				// The overlay is modal. Letting Tab move focus behind it would
+				// leave a visible switcher still swallowing Enter while
+				// keystrokes land in Zotero's UI underneath.
+				consume();
+				this._focusInput();
 				break;
 			default:
 				break;
@@ -353,8 +369,12 @@ var ZQS_Overlay = {
 			// under a stationary pointer would steal the selection and the
 			// user could never arrow past it.
 			const p = this._lastPointer;
-			if (p && p.x === event.screenX && p.y === event.screenY) return;
 			this._lastPointer = { x: event.screenX, y: event.screenY };
+			// The first move after open() only establishes a baseline. Selecting
+			// on it would let the synthesized move that follows the very first
+			// render hijack the preselected top result.
+			if (!p) return;
+			if (p.x === event.screenX && p.y === event.screenY) return;
 
 			const idx = this._indexFromEvent(event);
 			if (idx !== -1 && idx !== this._selectedIndex) {
@@ -395,6 +415,16 @@ var ZQS_Overlay = {
 	open() {
 		if (!this._root || this._visible) return;
 
+		// Remember where focus was so Escape can put it back. Without this the
+		// chrome window is left with nothing focused and the next keystroke
+		// goes nowhere.
+		try {
+			this._prevFocus = this._doc.activeElement;
+		}
+		catch (e) {
+			this._prevFocus = null;
+		}
+
 		this._cancelPending();
 		this._results = [];
 		this._selectedIndex = 0;
@@ -409,7 +439,13 @@ var ZQS_Overlay = {
 		this._focusInput();
 	},
 
-	close() {
+	/**
+	 * @param {Object} [options]
+	 * @param {Boolean} [options.restoreFocus] put focus back where it was.
+	 *   Pass false when the caller is about to move focus deliberately (opening
+	 *   a tab), so we don't fight Zotero's own refocus hook.
+	 */
+	close({ restoreFocus = true } = {}) {
 		if (!this._root || !this._visible) return;
 		this._cancelPending();
 		this._visible = false;
@@ -418,6 +454,18 @@ var ZQS_Overlay = {
 			this._input.blur();
 		}
 		catch (e) {}
+
+		if (restoreFocus && this._prevFocus) {
+			try {
+				// The element may have been torn down (a tab closed) while the
+				// overlay was up, so verify it is still in the document.
+				if (this._prevFocus.isConnected !== false && this._prevFocus.focus) {
+					this._prevFocus.focus();
+				}
+			}
+			catch (e) {}
+		}
+		this._prevFocus = null;
 	},
 
 	/** Cancel the debounce AND invalidate any search already past it. */
@@ -663,7 +711,8 @@ var ZQS_Overlay = {
 		// Close FIRST: Zotero_Tabs.select() snapshots document.activeElement and
 		// fires the type's refocus hook on setTimeout(…, 0) (tabs.js:911-916,
 		// 941-944), so anything focused after it is stolen a tick later.
-		this.close();
+		// restoreFocus:false because the tab we are about to open owns focus.
+		this.close({ restoreFocus: false });
 
 		win.ZQS_Opener.openEntry(selected.entry, { reveal, background }).catch((e) => {
 			Zotero.logError(new Error('[quick-switcher] open failed: ' + e));

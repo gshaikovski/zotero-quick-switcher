@@ -83,14 +83,21 @@ var ZQS_Opener = {
 				}
 
 				if (exists) {
-					// Reader.open returns undefined when it switched to an
-					// existing UNLOADED tab (reader.js:2719) — which is common,
-					// since Zotero unloads all but the 3-5 most recent reader
-					// tabs. Never dereference the return value.
-					await Zotero.Reader.open(attachment.id, null, {
-						openInBackground: background,
-					});
-					return;
+					try {
+						// Reader.open returns undefined when it switched to an
+						// existing UNLOADED tab (reader.js:2719) — which is
+						// common, since Zotero unloads all but the 3-5 most
+						// recent reader tabs. Never dereference the return value.
+						await Zotero.Reader.open(attachment.id, null, {
+							openInBackground: background,
+						});
+						return;
+					}
+					catch (e) {
+						// Unguarded, a throw here would skip the whole fallback
+						// chain below and make Enter a silent no-op.
+						Zotero.logError(new Error('[quick-switcher] Reader.open failed: ' + e));
+					}
 				}
 				// File is missing: fall through to viewItems, which shows the
 				// not-found dialog and can trigger a sync download.
@@ -101,7 +108,12 @@ var ZQS_Opener = {
 		// browser. Note viewItems does NOTHING — no error, no message — when
 		// there is no attachment and no url and no DOI (zoteroPane.js:5044-5068),
 		// so we check whether it had anything to act on and reveal if not.
-		if (attachment || this._hasLaunchableURL(item)) {
+		// NOTE: `attachment` is only ever a READER-openable one. An item whose
+		// sole attachment is a .docx / .pptx / image has attachment === null,
+		// so the gate has to ask about attachments in general — otherwise those
+		// items would skip viewItems entirely and just get revealed, never
+		// opening in the external app the way double-click does.
+		if (attachment || this._hasAnyAttachment(item) || this._hasLaunchableURL(item)) {
 			try {
 				await win.ZoteroPane.viewItems([item]);
 				return;
@@ -134,6 +146,25 @@ var ZQS_Opener = {
 		catch (e) {
 			return null;
 		}
+	},
+
+	/** Any non-trashed child attachment at all, reader-openable or not. */
+	_hasAnyAttachment(item) {
+		try {
+			if (item.isAttachment()) return true;
+			for (const id of item.getAttachments()) {
+				let att;
+				try {
+					att = Zotero.Items.get(id);
+				}
+				catch (e) {
+					continue;
+				}
+				if (att && !att.deleted) return true;
+			}
+		}
+		catch (e) {}
+		return false;
 	},
 
 	_hasLaunchableURL(item) {
