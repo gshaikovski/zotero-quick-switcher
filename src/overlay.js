@@ -716,11 +716,11 @@ var ZQS_Overlay = {
 			}
 			catch (e) {}
 			try {
-				// Anything outside My Library is shown with its library name.
-				// Item metadata is attacker-controlled — anyone with write
-				// access to a shared group library can craft a title that
-				// outranks the user's own paper for a habitual query. Naming
-				// the source is what makes that visible rather than silent.
+				// BACKSTOP. The index is restricted to My Library in SQL, so
+				// this should never fire. It stays because it is cheap and it
+				// fails safe: if that filter were ever wrong, a group-library
+				// item would be visibly labelled rather than silently sitting
+				// at the top of the list.
 				const userLib = Zotero.Libraries.userLibraryID;
 				if (item.libraryID !== userLib) {
 					rec.foreign = true;

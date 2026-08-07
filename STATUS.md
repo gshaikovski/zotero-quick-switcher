@@ -1,7 +1,7 @@
 # Where this stands
 
 **Ready to install and test.** Two correctness review passes and one performance/security/memory
-audit are folded in. The offline suite passes (86 assertions across six harnesses). It has still
+audit are folded in. The offline suite passes (92 assertions across six harnesses). It has still
 never been run inside Zotero — that is the remaining step, and it is yours.
 
 ## Install
@@ -20,10 +20,12 @@ Against a synthetic 100,000-paper library built on Zotero's real schema:
 | | |
 |---|---|
 | Index build (once, on first Cmd+O) | **214 ms**, chunked so it never blocks |
-| Index memory | **31 MB** (325 B/paper); 62 MB at the 200k cap |
-| Per keystroke | **6–37 ms**, worst case a very common word |
-| Adversarial 12-token query | 29 ms (flat, thanks to the character-bitmap prefilter) |
-| Hostile 10 MB item title | 1 ms, bounded — length-capped before it reaches anything |
+| Index memory | **38 MB** (entries + word index) |
+| Per keystroke | **2–15 ms** |
+| At the 200k cap | 795 ms build, 75 MB, 2–31 ms per keystroke |
+| Longest uninterrupted UI block, at the cap | **3.3 ms** — under one frame |
+| Adversarial 12-token query | 29 ms, flat (character-bitmap prefilter) |
+| Hostile 10 MB item title | 1 ms, bounded — length-capped on the way in |
 | Leak check | 41 B/cycle over 6,000 searches — i.e. flat |
 
 For comparison, the previous implementation at the same size: 194 MB of index **plus ~376 MB
@@ -34,6 +36,11 @@ permanently retained** in Zotero's object cache, and 50–260 ms of *blocking* p
 - **SQL only, no API fallback.** Fastest and simplest. If a future Zotero changes the database
   schema, the switcher stops returning results — but it now fails *loudly*: the overlay says
   "Search unavailable" and the reason is logged, rather than silently showing nothing.
+- **My Library only.** Group libraries are excluded in SQL, so a shared library cannot put a crafted
+  item under your reflexive Enter. Their papers stay reachable through Zotero's own search.
+- **Word index, with fuzzy as fallback.** Common words drop to ~2–10 ms. The cost: when the word
+  index already has 50+ hits, the fuzzy pass is skipped, so rankings can occasionally differ from an
+  exhaustive scan.
 - **Lazy index build.** Zero cost to Zotero's startup. The build kicks off the moment the overlay
   opens, so it overlaps your first keystrokes rather than following them.
 - **200k paper cap, newest first.** Bounded at ~62 MB. Beyond that the older tail is not
@@ -64,7 +71,7 @@ Output**, and look for `[quick-switcher]`.
 ./test/run.sh
 ```
 
-Six harnesses, 86 assertions, no Zotero required and nothing touched outside the repo. They cover
+Six harnesses, 92 assertions, no Zotero required and nothing touched outside the repo. They cover
 ranking and fuzzy matching, text normalisation, hotkey matching across layouts, the overlay state
 machine and its races, plugin lifecycle (update/disable/window-close), and scale — including
 memory-per-entry, keystroke latency, chunk yielding, search abandonment, hostile metadata and a

@@ -6,8 +6,8 @@
  *
  * ── WHY THIS SHAPE ────────────────────────────────────────────────────────
  *
- * Three approaches were measured against a synthetic 100k-item library on the
- * real Zotero schema:
+ * Three approaches were measured against synthetic libraries built on the real
+ * Zotero schema:
  *
  *   Zotero.Items.getAll + getAsync + loadDataTypes  → 194 MB of our own index
  *       PLUS ~376 MB permanently retained in Zotero's unbounded _objectCache,
@@ -15,8 +15,12 @@
  *   Zotero.Search (SQL LIKE) per keystroke          → 81–92 ms every keystroke,
  *       and no fuzzy matching. itemDataValues.value has no index, so every
  *       LIKE '%token%' is a full table scan; rare tokens are no cheaper.
- *   One SQL query → compact in-memory index         → 280 ms once, ~28 MB,
- *       12–23 ms per keystroke, fuzzy preserved.  ← this file
+ *   One SQL query → compact index + word index      → ← this file
+ *       at the 200k cap: 795 ms to build, 75 MB, 2–31 ms per keystroke, and no
+ *       uninterrupted block longer than 3.3 ms.
+ *
+ * Search runs the word index first and falls back to the full fuzzy scan only
+ * when that finds little — which is exactly when fuzzy matters.
  *
  * The index therefore holds ONLY what matching needs: normalised strings, a
  * character bitmap, an id and a stable key. Everything shown on screen —
@@ -66,8 +70,22 @@ var ZQS_Engine = {
 		publication: 0.4,
 	},
 
+	/**
+	 * When a word-index lookup yields fewer than this many hits, the full fuzzy
+	 * scan runs as well and the two are merged. That is exactly when fuzzy
+	 * matters (typing "aiayn"), and skipping it when there are already plenty of
+	 * ordinary matches is what keeps common words fast.
+	 */
+	FUZZY_FALLBACK_BELOW: 50,
+
 	_win: null,
 	_entries: [],
+	/** Sorted unique words → postings, for prefix lookup. */
+	_vocab: null,
+	_postStart: null,
+	_postings: null,
+	_stamp: null,
+	_stampGen: 0,
 	_building: null,
 	_buildGen: 0,
 	_dirty: true,
@@ -129,6 +147,7 @@ var ZQS_Engine = {
 		// instead of running to completion and repopulating a dead engine.
 		this._buildGen++;
 		this._entries = [];
+		this._vocab = this._postStart = this._postings = this._stamp = null;
 		this._building = null;
 		this._dirty = true;
 		this._lastBuiltStart = 0;
@@ -204,6 +223,11 @@ var ZQS_Engine = {
 	 * Excluded: trashed items, child attachments, child notes, and annotations.
 	 * Annotations matter — at 100k papers a library holds ~250k of them, and
 	 * Zotero's own getAll(onlyTopLevel) does NOT filter them out.
+	 *
+	 * ALSO excluded: every library but your own. Anyone with write access to a
+	 * shared group library can craft an item that outranks your own paper for a
+	 * query you type daily, and Enter would then launch a link they chose. The
+	 * libraryID is a bound parameter, not interpolated.
 	 */
 	SQL_ITEMS: `
 		SELECT i.itemID, i.libraryID, i.key, i.dateModified,
@@ -221,7 +245,8 @@ var ZQS_Engine = {
 		JOIN itemDataValues idv ON idv.valueID = id.valueID
 		LEFT JOIN baseFieldMappingsCombined bfm
 			ON bfm.itemTypeID = i.itemTypeID AND bfm.fieldID = id.fieldID
-		WHERE i.itemID NOT IN (SELECT itemID FROM deletedItems)
+		WHERE i.libraryID = ?
+			AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
 			AND i.itemID NOT IN (SELECT itemID FROM itemAnnotations)
 			AND i.itemID NOT IN (SELECT itemID FROM itemNotes WHERE parentItemID IS NOT NULL)
 			AND i.itemID NOT IN (SELECT itemID FROM itemAttachments WHERE parentItemID IS NOT NULL)
@@ -233,6 +258,8 @@ var ZQS_Engine = {
 		SELECT ic.itemID, group_concat(c.lastName || ' ' || c.firstName, ' ') AS names
 		FROM itemCreators ic
 		JOIN creators c ON c.creatorID = ic.creatorID
+		JOIN items i ON i.itemID = ic.itemID
+		WHERE i.libraryID = ?
 		GROUP BY ic.itemID
 	`,
 
@@ -285,21 +312,31 @@ var ZQS_Engine = {
 	async _build(gen) {
 		const t0 = Date.now();
 
-		const rows = await Zotero.DB.queryAsync(this.SQL_ITEMS);
+		// My Library only, per the maintainer's decision. Read it up front: if
+		// it is unavailable we must fail rather than quietly widen the scope to
+		// include group libraries.
+		let userLibraryID;
+		try {
+			userLibraryID = Zotero.Libraries.userLibraryID;
+		}
+		catch (e) {
+			throw new Error('user library not available yet: ' + e);
+		}
+		if (userLibraryID === undefined || userLibraryID === null) {
+			throw new Error('user library id is unavailable');
+		}
+
+		const rows = await Zotero.DB.queryAsync(this.SQL_ITEMS, [userLibraryID]);
 		if (gen !== this._buildGen) return this._entries;
 
-		const creatorRows = await Zotero.DB.queryAsync(this.SQL_CREATORS);
+		const creatorRows = await Zotero.DB.queryAsync(this.SQL_CREATORS, [userLibraryID]);
 		if (gen !== this._buildGen) return this._entries;
 
 		const creators = new Map();
 		for (const r of creatorRows) creators.set(r.itemID, r.names);
 
-		// Feeds are noise for a paper switcher; drop them.
-		const feedIDs = new Set();
-		try {
-			for (const f of Zotero.Feeds.getAll()) feedIDs.add(f.libraryID);
-		}
-		catch (e) {}
+		// Feeds need no special handling now: they are separate libraries, and
+		// only the user library is queried.
 
 		const entries = [];
 		this._truncated = false;
@@ -320,8 +357,6 @@ var ZQS_Engine = {
 			}
 
 			const row = rows[i];
-			if (feedIDs.has(row.libraryID)) continue;
-
 			const title = this.normalize(
 				(row.title || '').slice(0, this.CAP_TITLE));
 			if (!title) continue; // nothing searchable
@@ -345,11 +380,136 @@ var ZQS_Engine = {
 			});
 		}
 
+		this._buildWordIndex(entries);
+
 		// Deliberately does not log titles: Debug Output is routinely submitted
 		// to Zotero support, and item titles are the user's private research.
-		Zotero.debug('[quick-switcher] indexed ' + entries.length + ' items in '
+		Zotero.debug('[quick-switcher] indexed ' + entries.length + ' items ('
+			+ (this._vocab ? this._vocab.length : 0) + ' words) in '
 			+ (Date.now() - t0) + ' ms' + (this._truncated ? ' (capped)' : ''));
 		return entries;
+	},
+
+	/**
+	 * Inverted index: word → entries containing it.
+	 *
+	 * Stored as a sorted vocabulary plus flat Int32Array postings, so a prefix
+	 * query is a binary search for a contiguous range rather than a scan of the
+	 * vocabulary. Costs ~18 MB at the 200k cap and takes one-word queries from
+	 * tens of milliseconds to about two.
+	 */
+	_buildWordIndex(entries) {
+		const map = new Map();
+		for (let i = 0; i < entries.length; i++) {
+			const e = entries[i];
+			const seen = new Set();
+			const add = (text) => {
+				if (!text) return;
+				const words = text.split(' ');
+				for (let w = 0; w < words.length; w++) {
+					const word = words[w];
+					if (!word || seen.has(word)) continue;
+					seen.add(word);
+					let arr = map.get(word);
+					if (!arr) map.set(word, (arr = []));
+					arr.push(i);
+				}
+			};
+			add(e.t);
+			add(e.c);
+			add(e.p);
+			if (e.y) add(e.y);
+			if (e.i) add(e.i);   // so an acronym query hits the fast path too
+		}
+
+		const vocab = [...map.keys()].sort();
+		const postStart = new Int32Array(vocab.length + 1);
+		let totalPostings = 0;
+		for (let v = 0; v < vocab.length; v++) {
+			postStart[v] = totalPostings;
+			totalPostings += map.get(vocab[v]).length;
+		}
+		postStart[vocab.length] = totalPostings;
+
+		const postings = new Int32Array(totalPostings);
+		let at = 0;
+		for (let v = 0; v < vocab.length; v++) {
+			const arr = map.get(vocab[v]);
+			for (let k = 0; k < arr.length; k++) postings[at++] = arr[k];
+		}
+
+		this._vocab = vocab;
+		this._postStart = postStart;
+		this._postings = postings;
+		this._stamp = new Int32Array(entries.length);
+		this._stampGen = 0;
+	},
+
+	/** Index of the first vocabulary word >= target. */
+	_lowerBound(target) {
+		const v = this._vocab;
+		let lo = 0, hi = v.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (v[mid] < target) lo = mid + 1;
+			else hi = mid;
+		}
+		return lo;
+	},
+
+	/**
+	 * Entry indices whose words prefix-match EVERY token.
+	 * @returns {Int32Array|null} null when the word index is unusable
+	 */
+	_candidates(tokens) {
+		if (!this._vocab || !this._vocab.length || !this._stamp) return null;
+
+		// Stamp-based intersection: an entry reaching gen+tokens.length was seen
+		// for every token. Avoids clearing a big array between searches.
+		const stamp = this._stamp;
+		const base = this._stampGen;
+		this._stampGen += tokens.length + 1;
+		if (this._stampGen > 2000000000) {           // wrap safely
+			stamp.fill(0);
+			this._stampGen = tokens.length + 1;
+		}
+
+		for (let t = 0; t < tokens.length; t++) {
+			const token = tokens[t];
+			const lo = this._lowerBound(token);
+			const want = base + t;
+			// Vocabulary is sorted, so every word with this prefix is contiguous.
+			for (let v = lo; v < this._vocab.length; v++) {
+				if (!this._vocab[v].startsWith(token)) break;
+				const from = this._postStart[v];
+				const to = this._postStart[v + 1];
+				for (let p = from; p < to; p++) {
+					const e = this._postings[p];
+					// Only advance entries that matched every earlier token.
+					if (stamp[e] === want) stamp[e] = want + 1;
+					else if (t === 0 && stamp[e] < base) stamp[e] = base + 1;
+				}
+			}
+		}
+
+		const target = base + tokens.length;
+		const out = [];
+		// Walk the first token's postings only: anything matching all tokens
+		// must appear there.
+		const firstLo = this._lowerBound(tokens[0]);
+		for (let v = firstLo; v < this._vocab.length; v++) {
+			if (!this._vocab[v].startsWith(tokens[0])) break;
+			const from = this._postStart[v];
+			const to = this._postStart[v + 1];
+			for (let p = from; p < to; p++) {
+				const e = this._postings[p];
+				if (stamp[e] === target) {
+					stamp[e] = target + 1;   // dedupe
+					out.push(e);
+				}
+			}
+		}
+		return out;
 	},
 
 	/* ---------------------------------------------------------------- *
@@ -482,48 +642,73 @@ var ZQS_Engine = {
 			return { results: [], total: 0, truncated: false, abandoned: true };
 		}
 
-		// Bounded top-K. The previous version sorted every survivor: a
-		// one-character query at 100k items sorted 98,723 entries to show 10.
+		// Bounded top-K. Sorting every survivor meant a one-character query at
+		// 100k items sorted ~99,000 entries in order to show ten.
 		const keep = limit * 4;
-		let top = [];
-		let cutoff = 0;
-		let total = 0;
+		const top = [];
+		const state = { cutoff: 0, total: 0, seen: null };
 
-		const n = entries.length;
-		for (let i = 0; i < n; i++) {
-			if ((i & (this.CHUNK - 1)) === 0 && i > 0) {
-				await new Promise(r => this._win.setTimeout(r, 0));
-				if (isCurrent && !isCurrent()) {
-					return { results: [], total: 0, truncated: false, abandoned: true };
-				}
-			}
-
-			const e = entries[i];
-
-			// One integer AND rejects most entries before any string work.
-			let ok = true;
-			for (let j = 0; j < tokenMasks.length; j++) {
-				if ((e.m & tokenMasks[j]) !== tokenMasks[j]) { ok = false; break; }
-			}
-			if (!ok) continue;
-
+		const consider = (e) => {
 			let score;
 			try {
 				score = this.scoreEntry(e, tokens, q);
 			}
 			catch (err) {
-				continue; // one bad entry must never break the search
+				return; // one bad entry must never break the search
 			}
-			if (score <= 0) continue;
-
-			total++;
-			if (score > cutoff || top.length < keep) {
+			if (score <= 0) return;
+			state.total++;
+			if (score > state.cutoff || top.length < keep) {
 				top.push({ entry: e, score });
 				if (top.length >= keep * 2) {
 					top.sort((a, b) => b.score - a.score);
 					top.length = keep;
-					cutoff = top[top.length - 1].score;
+					state.cutoff = top[top.length - 1].score;
 				}
+			}
+		};
+
+		// FAST PATH: the word index gives entries whose words prefix-match every
+		// token. That covers the overwhelming majority of real queries at a
+		// fraction of the cost of scanning the library.
+		let usedWordIndex = false;
+		const candidates = this._candidates(tokens);
+		if (candidates) {
+			usedWordIndex = true;
+			for (let i = 0; i < candidates.length; i++) {
+				if ((i & (this.CHUNK - 1)) === 0 && i > 0) {
+					await new Promise(r => this._win.setTimeout(r, 0));
+					if (isCurrent && !isCurrent()) {
+						return { results: [], total: 0, truncated: false, abandoned: true };
+					}
+				}
+				consider(entries[candidates[i]]);
+			}
+		}
+
+		// FUZZY FALLBACK: only when ordinary matching found little. This is what
+		// keeps "aiayn" and mid-word substrings working, while a common word that
+		// already has plenty of hits never pays for a full scan.
+		if (!usedWordIndex || state.total < this.FUZZY_FALLBACK_BELOW) {
+			const already = new Set(top.map(r => r.entry.id));
+			const n = entries.length;
+			for (let i = 0; i < n; i++) {
+				if ((i & (this.CHUNK - 1)) === 0 && i > 0) {
+					await new Promise(r => this._win.setTimeout(r, 0));
+					if (isCurrent && !isCurrent()) {
+						return { results: [], total: 0, truncated: false, abandoned: true };
+					}
+				}
+
+				const e = entries[i];
+				// One integer AND rejects most entries before any string work.
+				let ok = true;
+				for (let j = 0; j < tokenMasks.length; j++) {
+					if ((e.m & tokenMasks[j]) !== tokenMasks[j]) { ok = false; break; }
+				}
+				if (!ok) continue;
+				if (already.has(e.id)) continue;
+				consider(e);
 			}
 		}
 
@@ -534,7 +719,7 @@ var ZQS_Engine = {
 
 		return {
 			results: top.slice(0, limit),
-			total,
+			total: state.total,
 			truncated: this._truncated,
 			abandoned: false,
 		};

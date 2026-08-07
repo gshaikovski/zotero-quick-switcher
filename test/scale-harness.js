@@ -66,15 +66,36 @@ const gc = () => { if (global.gc) { global.gc(); global.gc(); } };
 		['subsequence', 'aiayn'],
 		['no match', 'zzzqqq'],
 	];
-	let worst = 0;
+	// Two different things matter, and only one of them is a freeze:
+	//   - BLOCK: the longest uninterrupted stretch on the main thread. Over
+	//     ~16 ms this drops frames; over ~50 ms the UI visibly stalls.
+	//   - WALL: total time to results. Behind the 110 ms debounce, up to a few
+	//     hundred ms here is merely "results appear", not "Zotero froze".
+	let worstWall = 0, worstBlock = 0;
 	for (const [label, q] of QUERIES) {
+		let lastResume = process.hrtime.bigint();
+		let block = 0;
+		const origSetTimeout = win.setTimeout;
+		win.setTimeout = (fn) => origSetTimeout.call(win, () => {
+			const b = Number(process.hrtime.bigint() - lastResume) / 1e6;
+			if (b > block) block = b;
+			lastResume = process.hrtime.bigint();
+			fn();
+		});
 		const s = process.hrtime.bigint();
 		const r = await search(E, win, q);
 		const ms = Number(process.hrtime.bigint() - s) / 1e6;
-		if (ms > worst) worst = ms;
-		console.log(`  ${label.padEnd(16)} ${ms.toFixed(1).padStart(7)} ms   ${String(r.total).padStart(7)} hits`);
+		win.setTimeout = origSetTimeout;
+		const tail = Number(process.hrtime.bigint() - lastResume) / 1e6;
+		if (tail > block) block = tail;
+		if (ms > worstWall) worstWall = ms;
+		if (block > worstBlock) worstBlock = block;
+		console.log(`  ${label.padEnd(16)} wall ${ms.toFixed(1).padStart(6)} ms   longest block ${block.toFixed(1).padStart(5)} ms   ${String(r.total).padStart(7)} hits`);
 	}
-	check('worst query stays under budget', worst < BUDGET_MS, `worst ${worst.toFixed(1)} ms (budget ${BUDGET_MS})`);
+	check('never blocks the UI for long', worstBlock < 25,
+		`longest uninterrupted block ${worstBlock.toFixed(1)} ms`);
+	check('results arrive promptly', worstWall < 250,
+		`worst wall-clock ${worstWall.toFixed(1)} ms`);
 
 	console.log('\n--- chunk yielding (UI must never block) ---');
 	// The scan must hand control back repeatedly rather than running straight
@@ -141,17 +162,86 @@ const gc = () => { if (global.gc) { global.gc(); global.gc(); } };
 	check('DB failure is logged', f.Zotero._errors.some(e => /index build failed/.test(e)),
 		`${f.Zotero._errors.length} logged`);
 
-	console.log('\n--- index memory (destructive: measured last) ---');
+	console.log('\n--- recovery from a failed build ---');
+	// An audit pass reproduced a wedge here at an earlier commit: a throw left
+	// _building holding a stranded promise and every later search failed.
+	{
+		const rec = makeZotero(papers.slice(0, 5));
+		const RE = loadEngine(rec.Zotero);
+		const rwin = makeWin(rec.Zotero);
+		RE.init(rwin);
+		const realQ = rec.Zotero.DB.queryAsync;
+		let failing = true;
+		rec.Zotero.DB.queryAsync = async (sql) => {
+			if (failing) throw new Error('schema changed');
+			return realQ(sql);
+		};
+		try { await buildIndex(RE, rwin); } catch (e) {}
+		check('failed build does not strand _building', RE._building === null,
+			RE._building === null ? '' : 'STRANDED');
+		check('failed build leaves the index dirty for a retry', RE._dirty === true);
+
+		failing = false;
+		RE._lastBuiltStart = 0;      // as a later keystroke would
+		let recovered = false, why = '';
+		try {
+			// Recovery means the index actually rebuilds — not that this
+			// particular query matches these particular synthetic papers.
+			await search(RE, rwin, 'zzz-no-match');
+			recovered = RE._entries.length === 5;
+			why = `${RE._entries.length}/5 entries`;
+		}
+		catch (e) { why = 'threw: ' + e.message; }
+		check('engine recovers once the DB works again', recovered, why);
+	}
+
+	console.log('\n--- empty library does not re-scan every keystroke ---');
+	{
+		const emp = makeZotero([]);
+		const EE = loadEngine(emp.Zotero);
+		const ewin = makeWin(emp.Zotero);
+		EE.init(ewin);
+		await buildIndex(EE, ewin);
+		const after = emp.Zotero.DB._calls;
+		await search(EE, ewin, 'anything');
+		await search(EE, ewin, 'more');
+		check('empty index is cached, not rebuilt per keystroke',
+			emp.Zotero.DB._calls === after, `${emp.Zotero.DB._calls - after} extra queries`);
+	}
+
+	console.log('\n--- memory (destructive: measured last) ---');
 	gc();
-	const withIndex = process.memoryUsage().heapUsed;
+	// TypedArray backing stores live OUTSIDE the JS heap, so heapUsed alone
+	// would under-report the postings by an order of magnitude.
+	const used = () => {
+		const m = process.memoryUsage();
+		return m.heapUsed + m.arrayBuffers;
+	};
+	const start = used();
+
+	// Word index first: vocabulary + flat postings.
+	const vocabWords = E._vocab ? E._vocab.length : 0;
+	const postings = E._postings ? E._postings.length : 0;
+	E._vocab = E._postStart = E._postings = E._stamp = null;
+	gc();
+	const afterWords = used();
+	const wordBytes = start - afterWords;
+
 	E._entries = [];          // sole reference dropped
 	gc();
-	const bytes = withIndex - process.memoryUsage().heapUsed;
-	const perEntry = Math.round(bytes / Math.max(1, count));
-	console.log(`  index ${mb(bytes)}  =  ${perEntry} B/entry`);
-	console.log(`  projected: 200k cap -> ${mb(perEntry * 200000)}`);
+	const entryBytes = afterWords - used();
+
+	const perEntry = Math.round(entryBytes / Math.max(1, count));
+	const totalBytes = wordBytes + entryBytes;
+	console.log(`  entries    ${mb(entryBytes)}  (${perEntry} B/entry)`);
+	console.log(`  word index ${mb(wordBytes)}  (${vocabWords.toLocaleString()} words, ${postings.toLocaleString()} postings)`);
+	console.log(`  TOTAL      ${mb(totalBytes)}`);
+	console.log(`  projected at the 200k cap: ${mb(totalBytes / count * 200000)}`);
 	check('index memory per entry is bounded', perEntry > 0 && perEntry < MAX_BYTES_PER_ENTRY,
 		`${perEntry} B/entry (limit ${MAX_BYTES_PER_ENTRY})`);
+	check('total memory at the cap stays reasonable',
+		(totalBytes / count * 200000) < 120 * 1024 * 1024,
+		mb(totalBytes / count * 200000) + ' projected at 200k');
 
 	console.log(`\n${pass}/${total} passed`);
 	process.exit(pass === total ? 0 : 1);

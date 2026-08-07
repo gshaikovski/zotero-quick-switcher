@@ -71,10 +71,14 @@ Three approaches were measured against a 100k-paper library built on Zotero's re
 |---|---|---|---|---|
 | `Zotero.Items.getAll` + `getAsync` + `loadDataTypes` | seconds | 50–260 ms | 194 MB **+ ~376 MB** permanently retained in Zotero's `_objectCache` | yes |
 | `Zotero.Search` (SQL `LIKE`) per keystroke | none | 81–92 ms | ~0 | **no** |
-| **One SQL query → compact in-memory index** | 214 ms once | **6–37 ms** | **31 MB** | yes |
+| **One SQL query → compact index + word index** | 214 ms once | **2–15 ms** | **38 MB** | yes |
 
 The third is what this plugin does. Note the second is the *slowest* — SQL cannot help here, because
 there is no index to use and no way to express subsequence matching.
+
+At the 200,000-paper cap: 795 ms to build, 75 MB, 2–31 ms per keystroke, and **no uninterrupted
+main-thread block longer than 3.3 ms** — the scan yields between slices, so the UI never stutters
+even while results are still arriving.
 
 **1. Index** (`src/engine.js`). One static SQL query via `Zotero.DB.queryAsync`, built lazily on your
 first Cmd+O. It never materialises `Zotero.Item` objects — that is what caused the 376 MB of
@@ -88,16 +92,20 @@ The index stores only what matching needs: normalised strings, a character bitma
 stable key — **325 bytes per paper**. Everything you see on screen is fetched from Zotero for the
 ≤50 rows actually displayed.
 
-**2. Rank.** Per token, per field, strongest match wins: exact > prefix > word-start > substring >
+**2. Match.** A **word index** (sorted vocabulary + flat `Int32Array` postings) answers the common
+case: a binary search finds every word starting with your token, and postings are intersected across
+tokens. That took a common word from 71 ms to 9.6 ms at 200k papers.
+
+Full **fuzzy scanning is the fallback**, running only when the word index finds fewer than 50 hits —
+which is exactly when you need it (`aiayn`, or a mid-word substring). When it runs, a **character
+bitmap** per entry rejects most candidates with a single integer AND before any string work.
+
+**3. Rank.** Per token, per field, strongest match wins: exact > prefix > word-start > substring >
 subsequence. Title outweighs creators, which outweigh venue and year. Every token must match
-something, so multi-word queries narrow rather than broaden.
+something, so multi-word queries narrow rather than broaden. Field scoring **short-circuits**, so a
+perfect title match never bothers scoring the venue.
 
-Two things keep this fast. A **character bitmap** per entry rejects most candidates with a single
-integer AND before any string work — 122× faster on selective queries, and it flattens the
-adversarial many-token case that would otherwise be quadratic. And field scoring **short-circuits**,
-so a perfect title match never bothers scoring the venue.
-
-**3. Scan.** Chunked and abandonable: the scan yields to the event loop between slices, so the UI
+**4. Scan.** Chunked and abandonable: the scan yields to the event loop between slices, so the UI
 never blocks, and a superseded search stops the moment you type another character. Typing ten
 characters costs roughly one scan, not ten.
 
@@ -133,9 +141,11 @@ can write to. The design accounts for that:
 - **Rendering is `textContent` only** — no `innerHTML` anywhere — and titles are stripped of
   bidirectional overrides and zero-width characters, which could otherwise make a row read as a
   different paper than the one Enter opens.
-- **Results from outside My Library are badged with their library name.** Anyone with write access
-  to a shared group library can craft a title that outranks your own paper for a query you type
-  habitually; naming the source makes that visible instead of silent.
+- **Only My Library is indexed.** Group libraries are excluded in SQL. Anyone with write access to a
+  shared library could otherwise craft a title that outranks your own paper for a query you type
+  daily, leaving a link of their choosing under your reflexive Enter. Group papers remain findable
+  through Zotero's own search. (A library-name badge remains in the render path as a backstop, in
+  case that filter is ever wrong.)
 - **Entries carry the item's stable key.** SQLite reuses rowids after deletion, so an id cached at
   index time is re-checked before anything is opened.
 - **Debug output never contains item titles.** Zotero's Debug Output is routinely submitted to
@@ -146,8 +156,13 @@ can write to. The design accounts for that:
 
 ## Known limitations
 
-- **Very large libraries are capped at 200,000 papers**, most-recently-modified first (~62 MB).
-  Beyond that the older tail is not fuzzy-searchable. The status line says so when it applies.
+- **Very large libraries are capped at 200,000 papers**, most-recently-modified first (~75 MB).
+  Beyond that the older tail is not searchable here. The status line says so when it applies.
+- **Fuzzy matching is a fallback, not always-on.** When the word index already finds 50+ ordinary
+  matches, the fuzzy pass is skipped — so a mid-word substring match can occasionally be ranked
+  differently than it would be under an exhaustive scan. This is the trade that keeps common words
+  at ~2–10 ms.
+- **Group libraries are not searchable** from the switcher. See Security.
 - The index rebuilds wholesale when items change, rate-limited to once every 5 seconds. Patching
   individual items incrementally would be faster during a large sync but is not implemented.
 - A reader opened in its **own window** (rather than a tab) doesn't get the overlay — that's a
