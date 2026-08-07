@@ -334,7 +334,7 @@ var ZQS_Overlay = {
 				+ '#zqs-overlay[hidden]{display:none}'
 				+ '#zqs-overlay .zqs-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.32)}'
 				+ '#zqs-overlay .zqs-modal{position:relative;width:640px;max-width:92vw;'
-				+ 'max-height:76vh;overflow:hidden;background:Menu;color:MenuText;'
+				+ 'max-height:76vh;overflow:hidden;background:Canvas;color:CanvasText;'
 				+ 'border:1px solid ThreeDShadow;border-radius:10px}'
 				+ '#zqs-overlay .zqs-input{width:100%;box-sizing:border-box;padding:14px 16px;'
 				+ 'border:0;background:transparent;color:inherit;font-size:1.25em}'

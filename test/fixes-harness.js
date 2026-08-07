@@ -68,6 +68,35 @@ const PAPERS = [
 	check('collapses newlines', O._sanitize('a\nb\tc') === 'a b c');
 	check('caps runaway length', O._sanitize('x'.repeat(5000)).length <= 300);
 
+	console.log('\n--- overlay opacity ---');
+	// The modal must be OPAQUE. Zotero's --color-menu / --material-menu are
+	// translucent (rgba(...,.72) light, rgba(...,.58) dark) because the OS
+	// paints a blurred backdrop behind native menus; a plain div gets none, so
+	// the PDF underneath shows through. This shipped twice; hence the test.
+	const css = fs.readFileSync(__dirname + '/../skin/quickSwitcher.css', 'utf8');
+	const declarations = css
+		.replace(/\/\*[\s\S]*?\*\//g, '')          // strip comments
+		.split('\n')
+		.filter(l => /^\s*[a-z-]+\s*:/.test(l));
+	const translucent = declarations.filter(l =>
+		/var\(--(color-menu|material-menu|color-border)\b/.test(l));
+	check('no translucent theme token is used in a declaration',
+		translucent.length === 0, JSON.stringify(translucent));
+
+	const modal = css.slice(css.indexOf('.zqs-modal'), css.indexOf('.zqs-input'));
+	check('modal background is an opaque token',
+		/background:\s*var\(--color-background/.test(modal),
+		(modal.match(/background:[^;]*;/) || ['none'])[0].trim());
+	check('modal fallback colour is opaque (Canvas, not Menu)',
+		/--color-background,\s*Canvas\)/.test(modal) && !/,\s*Menu\)/.test(modal));
+
+	// The inline emergency stylesheet has to be opaque too, or a failed
+	// stylesheet read leaves a see-through overlay covering the window.
+	const overlaySrc = fs.readFileSync(OVERLAY, 'utf8');
+	const fallbackCss = overlaySrc.slice(overlaySrc.indexOf('#zqs-overlay{position:fixed'));
+	check('inline fallback stylesheet is opaque too',
+		/background:Canvas/.test(fallbackCss) && !/background:Menu/.test(fallbackCss));
+
 	console.log(`\n${pass}/${total} passed`);
 	process.exit(pass === total ? 0 : 1);
 })();

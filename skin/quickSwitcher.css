@@ -53,11 +53,17 @@
 	min-height: 0;
 	overflow: hidden;
 
-	/* --color-menu (not --material-menu): the material tokens are translucent,
-	   which lets the PDF page underneath bleed through the result list. */
-	background: var(--color-menu, Menu);
-	color: var(--fill-primary, MenuText);
-	border: 1px solid var(--color-border, ThreeDShadow);
+	/* MUST be an opaque token. Both --color-menu and --material-menu are
+	   translucent (rgba(246,246,246,.72) light / rgba(40,40,40,.58) dark, and
+	   --material-menu is just var(--color-menu)). Zotero uses them on native
+	   menus, where the OS paints a blurred backdrop behind the popup; a plain
+	   div gets no backdrop, so the PDF underneath shows straight through.
+	   --color-background is #fff / #1e1e1e — opaque in both schemes. */
+	background: var(--color-background, Canvas);
+	color: var(--fill-primary, CanvasText);
+	/* --color-border is translucent too, so it would tint against whatever is
+	   behind the modal rather than against the modal itself. */
+	border: 1px solid var(--color-panedivider, ThreeDShadow);
 	border-radius: 10px;
 	box-shadow: 0 16px 48px rgba(0, 0, 0, 0.42);
 }
@@ -71,7 +77,7 @@
 	width: 100%;
 	padding: 14px 16px;
 	border: none;
-	border-bottom: 1px solid var(--color-border, ThreeDShadow);
+	border-bottom: 1px solid var(--color-panedivider, ThreeDShadow);
 	background: transparent;
 	color: inherit;
 	font: inherit;
@@ -178,8 +184,9 @@
 #zqs-overlay .zqs-status {
 	padding: 8px 16px;
 	font-size: 0.82em;
+	background: var(--color-sidepane, Canvas);
 	color: var(--fill-secondary, GrayText);
-	border-top: 1px solid var(--color-border, ThreeDShadow);
+	border-top: 1px solid var(--color-panedivider, ThreeDShadow);
 }
 
 /* ---------------- library provenance ---------------- */
@@ -197,7 +204,7 @@
 	font-size: 0.72em;
 	padding: 2px 7px;
 	border-radius: 999px;
-	border: 1px solid var(--color-border, ThreeDShadow);
+	border: 1px solid var(--color-panedivider, ThreeDShadow);
 	color: var(--fill-secondary, GrayText);
 }
 
