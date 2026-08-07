@@ -229,8 +229,7 @@ var ZQS_Engine = {
 	 * query you type daily, and Enter would then launch a link they chose. The
 	 * libraryID is a bound parameter, not interpolated.
 	 */
-	SQL_ITEMS: `
-		SELECT i.itemID, i.libraryID, i.key, i.dateModified,
+	SQL_ITEMS: `SELECT i.itemID, i.libraryID, i.key, i.dateModified,
 			MAX(CASE WHEN COALESCE(bfm.baseFieldID, id.fieldID) =
 				(SELECT fieldID FROM fieldsCombined WHERE fieldName='title')
 				THEN idv.value END) AS title,
@@ -254,8 +253,7 @@ var ZQS_Engine = {
 		ORDER BY i.dateModified DESC
 	`,
 
-	SQL_CREATORS: `
-		SELECT ic.itemID, group_concat(c.lastName || ' ' || c.firstName, ' ') AS names
+	SQL_CREATORS: `SELECT ic.itemID, group_concat(c.lastName || ' ' || c.firstName, ' ') AS names
 		FROM itemCreators ic
 		JOIN creators c ON c.creatorID = ic.creatorID
 		JOIN items i ON i.itemID = ic.itemID
@@ -311,6 +309,12 @@ var ZQS_Engine = {
 
 	async _build(gen) {
 		const t0 = Date.now();
+		// Zotero decides whether a statement is a SELECT with
+		// sql.match(/^[^a-z]*[^ ]+/i) and compares the WHOLE match against
+		// 'select' (db.js:645-652). A query that starts with a newline is
+		// therefore NOT recognised, and queryAsync silently returns undefined
+		// instead of rows. Any SQL added here must start at the keyword.
+		const q = (sql, params) => Zotero.DB.queryAsync(sql.trim(), params);
 
 		// My Library only, per the maintainer's decision. Read it up front: if
 		// it is unavailable we must fail rather than quietly widen the scope to
@@ -326,14 +330,19 @@ var ZQS_Engine = {
 			throw new Error('user library id is unavailable');
 		}
 
-		const rows = await Zotero.DB.queryAsync(this.SQL_ITEMS, [userLibraryID]);
+		const rows = await q(this.SQL_ITEMS, [userLibraryID]);
 		if (gen !== this._buildGen) return this._entries;
 
-		const creatorRows = await Zotero.DB.queryAsync(this.SQL_CREATORS, [userLibraryID]);
+		const creatorRows = await q(this.SQL_CREATORS, [userLibraryID]);
 		if (gen !== this._buildGen) return this._entries;
+
+		if (!rows) {
+			throw new Error('item query returned no result set '
+				+ '(Zotero.DB.queryAsync did not recognise the statement)');
+		}
 
 		const creators = new Map();
-		for (const r of creatorRows) creators.set(r.itemID, r.names);
+		for (const r of (creatorRows || [])) creators.set(r.itemID, r.names);
 
 		// Feeds need no special handling now: they are separate libraries, and
 		// only the user library is queried.

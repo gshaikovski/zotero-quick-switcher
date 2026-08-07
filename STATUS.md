@@ -1,8 +1,19 @@
 # Where this stands
 
-**Ready to install and test.** Two correctness review passes and one performance/security/memory
-audit are folded in. The offline suite passes (92 assertions across six harnesses). It has still
-never been run inside Zotero — that is the remaining step, and it is yours.
+**Fixed after the first real run.** The plugin failed on install with
+`creatorRows is undefined`. Cause: Zotero decides whether a statement is a SELECT with
+`sql.match(/^[^a-z]*[^ ]+/i)` and compares the **whole match** against `'select'`
+(`db.js:645-652`), so a query beginning with a newline is not recognised and `queryAsync` returns
+`undefined` instead of rows — silently. Both SQL constants were template literals starting with a
+newline.
+
+Every harness had stubbed `Zotero.DB.queryAsync` and handed back arrays, so none of them could
+possibly have caught it. `test/sql-harness.js` now executes the real SQL against a database built
+from Zotero's own shipped schema (`resource/schema/userdata.sql`), through a `queryAsync` shim that
+reproduces the statement detection exactly. Reintroducing the bug makes it fail; that was verified,
+not assumed.
+
+110 assertions across seven harnesses. Ready to reinstall.
 
 ## Install
 
@@ -71,11 +82,11 @@ Output**, and look for `[quick-switcher]`.
 ./test/run.sh
 ```
 
-Six harnesses, 92 assertions, no Zotero required and nothing touched outside the repo. They cover
+Seven harnesses, 110 assertions, no Zotero required and nothing touched outside the repo. They cover
 ranking and fuzzy matching, text normalisation, hotkey matching across layouts, the overlay state
-machine and its races, plugin lifecycle (update/disable/window-close), and scale — including
-memory-per-entry, keystroke latency, chunk yielding, search abandonment, hostile metadata and a
-loud-failure check on the SQL path.
+machine and its races, plugin lifecycle (update/disable/window-close), scale — including
+memory-per-entry, keystroke latency, chunk yielding, search abandonment and hostile metadata — and
+the real SQL executed against Zotero's own schema.
 
 ## History
 
