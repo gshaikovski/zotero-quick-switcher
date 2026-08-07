@@ -53,6 +53,10 @@ var ZQS_Overlay = {
 	_lastPointer: null,
 	_prevFocus: null,
 	_initGen: 0,
+	_rows: null,
+	_selectedRow: -1,
+	_display: null,
+	_pressedItemId: null,
 
 	_onKeyDownCapture: null,
 	_onWindowDeactivate: null,
@@ -103,10 +107,9 @@ var ZQS_Overlay = {
 
 		this._buildDOM();
 
-		// Warm the index in the background so the first Cmd+O is instant.
-		win.ZQS_Engine.ensureIndex().catch((e) => {
-			Zotero.debug('[quick-switcher] initial index build failed: ' + e);
-		});
+		// The index is built LAZILY, on the first Cmd+O — deliberately not here.
+		// Warming it at startup would add its cost to every Zotero launch even
+		// for sessions where the switcher is never used.
 
 		return { notifierIDs };
 	},
@@ -153,6 +156,9 @@ var ZQS_Overlay = {
 
 		this._root = this._backdrop = this._input = this._list = this._status = this._style = null;
 		this._prevFocus = null;
+		this._rows = null;
+		this._display = null;
+		this._selectedRow = -1;
 		this._results = [];
 		this._win = this._doc = null;
 		this._onKeyDownCapture = this._onWindowDeactivate = null;
@@ -397,7 +403,22 @@ var ZQS_Overlay = {
 		// list wholesale, but closest() still walks a detached node's ancestors,
 		// so a click landing on a row from a previous render would otherwise
 		// index into a different result array and open the wrong paper.
+		// Rows are reused across renders, so a row element outlives the result
+		// it displayed. Remember which item was under the pointer at mousedown
+		// and refuse the click if a re-render swapped a different item into that
+		// row in between — otherwise a result list refreshing between mousedown
+		// and click would open a paper the user never aimed at.
+		list.addEventListener('mousedown', (event) => {
+			const row = event.target.closest ? event.target.closest('.zqs-row') : null;
+			this._pressedItemId = row ? row.dataset.itemId : null;
+		});
+
 		list.addEventListener('click', (event) => {
+			const row = event.target.closest ? event.target.closest('.zqs-row') : null;
+			const pressed = this._pressedItemId;
+			this._pressedItemId = null;
+			if (!row || !pressed || row.dataset.itemId !== pressed) return;
+
 			const idx = this._indexFromEvent(event);
 			if (idx === -1) return;
 			this._selectedIndex = idx;
@@ -472,6 +493,9 @@ var ZQS_Overlay = {
 
 		this._cancelPending();
 		this._results = [];
+		this._display = null;
+		this._rows = null;
+		this._selectedRow = -1;
 		this._selectedIndex = 0;
 		this._lastPointer = null;
 		this._input.value = '';
@@ -482,6 +506,14 @@ var ZQS_Overlay = {
 		this._visible = true;
 
 		this._focusInput();
+
+		// Kick the (lazy) index build now, while the user is still typing their
+		// first characters, so the build overlaps the typing rather than
+		// following it. Chunked, so it does not block.
+		try {
+			this._win.ZQS_Engine.ensureIndex().catch(() => {});
+		}
+		catch (e) {}
 	},
 
 	/**
@@ -510,7 +542,22 @@ var ZQS_Overlay = {
 			}
 			catch (e) {}
 		}
+		// _prevFocus can be a reader tab's <browser>; holding it would pin a
+		// detached docshell. Results and display records are released too, so a
+		// closed switcher pins nothing.
 		this._prevFocus = null;
+		this._results = [];
+		this._display = null;
+		this._selectedRow = -1;
+		if (this._rows) {
+			for (const row of this._rows) {
+				try {
+					row.remove();
+				}
+				catch (e) {}
+			}
+			this._rows = null;
+		}
 	},
 
 	/** Cancel the debounce AND invalidate any search already past it. */
@@ -583,31 +630,125 @@ var ZQS_Overlay = {
 
 		let payload;
 		try {
-			payload = await this._win.ZQS_Engine.search(trimmed, { limit: this.MAX_RESULTS });
+			payload = await this._win.ZQS_Engine.search(trimmed, {
+				limit: this.MAX_RESULTS,
+				// Checked between chunks so a superseded scan stops immediately
+				// instead of finishing work that will be discarded. Typing ten
+				// characters costs about one scan, not ten.
+				isCurrent: () => this._stillCurrent(seq),
+			});
 		}
 		catch (e) {
 			Zotero.logError(new Error('[quick-switcher] search failed: ' + e));
 			if (!this._stillCurrent(seq)) return;
 			this._results = [];
 			this._renderSafely();
-			this._setStatus('Search failed — see Debug Output');
+			this._setStatus('Search unavailable — see Help → Debug Output');
 			return;
 		}
 
+		if (payload.abandoned || !this._stillCurrent(seq)) return;
+
+		// The index holds only matching data. Display strings come from Zotero
+		// for the handful of rows actually shown, which halves index memory and
+		// keeps Zotero's own title formatting (base-mapped fields and all).
+		let display;
+		try {
+			display = await this._loadDisplay(payload.results);
+		}
+		catch (e) {
+			Zotero.debug('[quick-switcher] display load failed: ' + e);
+			display = new Map();
+		}
 		if (!this._stillCurrent(seq)) return;
 
 		this._results = payload.results;
+		this._display = display;
 		this._selectedIndex = 0;
 		this._renderSafely();
 
 		if (!this._results.length) {
-			this._setStatus('No matches');
+			this._setStatus(payload.truncated
+				? 'No matches in the most recent items'
+				: 'No matches');
 		}
 		else {
 			const shown = this._results.length;
 			const more = payload.total > shown ? ` of ${payload.total}` : '';
-			this._setStatus(`${shown}${more} result${payload.total === 1 ? '' : 's'}`);
+			this._setStatus(`${shown}${more} result${payload.total === 1 ? '' : 's'}`
+				+ (payload.truncated ? ' · large library, newest indexed' : ''));
 		}
+	},
+
+	/**
+	 * Fetch display fields for the results being shown.
+	 * @returns {Promise<Map<Number, Object>>} itemID -> display record
+	 */
+	async _loadDisplay(results) {
+		const out = new Map();
+		if (!results.length) return out;
+
+		const ids = results.map(r => r.entry.id);
+		let items = [];
+		try {
+			items = await Zotero.Items.getAsync(ids);
+		}
+		catch (e) {
+			return out;
+		}
+
+		for (const item of items) {
+			if (!item) continue;
+			const rec = { title: '', meta: '', foreign: false };
+			try {
+				rec.title = this._sanitize(item.getDisplayTitle() || '');
+			}
+			catch (e) {}
+			try {
+				const bits = [];
+				const creator = item.getField('firstCreator', true);
+				if (creator) bits.push(creator);
+				const year = item.getField('year');
+				if (year) bits.push(year);
+				const pub = item.getField('publicationTitle', false, true);
+				if (pub) bits.push(pub);
+				rec.meta = this._sanitize(bits.join('  ·  '));
+			}
+			catch (e) {}
+			try {
+				// Anything outside My Library is shown with its library name.
+				// Item metadata is attacker-controlled — anyone with write
+				// access to a shared group library can craft a title that
+				// outranks the user's own paper for a habitual query. Naming
+				// the source is what makes that visible rather than silent.
+				const userLib = Zotero.Libraries.userLibraryID;
+				if (item.libraryID !== userLib) {
+					rec.foreign = true;
+					const lib = Zotero.Libraries.get(item.libraryID);
+					rec.libraryName = this._sanitize((lib && lib.name) || 'group library');
+				}
+			}
+			catch (e) {}
+			out.set(item.id, rec);
+		}
+		return out;
+	},
+
+	/**
+	 * Strip characters that let a title render as something other than what it
+	 * is: bidirectional overrides and zero-width/invisible characters. A
+	 * group-library item could otherwise display as a different paper than the
+	 * one Enter opens. Also collapses newlines and caps length, so one hostile
+	 * item cannot blow up the row.
+	 */
+	_sanitize(s) {
+		if (!s) return '';
+		return s.toString()
+			.replace(/[‪-‮⁦-⁩‎‏؜]/g, '')
+			.replace(/[​-‍⁠﻿]/g, '')
+			.replace(/\s+/g, ' ')
+			.slice(0, 300)
+			.trim();
 	},
 
 	/* ---------------------------------------------------------------- *
@@ -626,6 +767,9 @@ var ZQS_Overlay = {
 		catch (e) {
 			Zotero.logError(new Error('[quick-switcher] render failed: ' + e));
 			this._results = [];
+			this._display = null;
+			this._rows = null;
+			this._selectedRow = -1;
 			this._selectedIndex = 0;
 			try {
 				this._list.replaceChildren();
@@ -634,80 +778,120 @@ var ZQS_Overlay = {
 		}
 	},
 
+	/**
+	 * Rows are REUSED rather than rebuilt. The previous version recreated every
+	 * element on every keystroke — 200 element creations and 100 textContent
+	 * writes per character typed.
+	 */
 	_render() {
 		const doc = this._doc;
 		if (!doc || !this._list) return;
 
-		const win = this._win;
-		const tabs = win && win.Zotero_Tabs;
-		const frag = doc.createDocumentFragment();
+		const rows = this._rows || (this._rows = []);
+		const n = this._results.length;
 
-		this._results.forEach(({ entry }, index) => {
+		while (rows.length < n) {
 			const row = doc.createElement('div');
 			row.className = 'zqs-row';
-			row.dataset.itemId = String(entry.id);
-			row.dataset.index = String(index);
 			row.setAttribute('role', 'option');
 
 			const text = doc.createElement('div');
 			text.className = 'zqs-text';
-
 			const title = doc.createElement('div');
 			title.className = 'zqs-title';
-			title.textContent = entry.title || '(untitled)';
-
 			const meta = doc.createElement('div');
 			meta.className = 'zqs-meta';
-			meta.textContent = [entry.firstCreator, entry.year, entry.publication]
-				.filter(Boolean).join('  ·  ');
-
 			text.appendChild(title);
 			text.appendChild(meta);
-			row.appendChild(text);
 
-			// The attachment id is resolved synchronously at index time, so the
-			// "already open" badge needs no async work per row.
-			if (entry.attachmentID && tabs) {
-				let tabID;
-				try {
-					tabID = tabs.getTabIDByItemID(Number(entry.attachmentID));
-				}
-				catch (e) {}
-				if (tabID) {
-					const badge = doc.createElement('span');
-					badge.className = 'zqs-badge';
-					badge.textContent = 'open';
-					row.appendChild(badge);
-				}
+			const badge = doc.createElement('span');
+			badge.className = 'zqs-badge';
+			badge.hidden = true;
+
+			const lib = doc.createElement('span');
+			lib.className = 'zqs-lib';
+			lib.hidden = true;
+
+			row.appendChild(text);
+			row.appendChild(lib);
+			row.appendChild(badge);
+			row._zqs = { title, meta, badge, lib };
+			rows.push(row);
+			this._list.appendChild(row);
+		}
+
+		while (rows.length > n) {
+			const row = rows.pop();
+			try {
+				row.remove();
+			}
+			catch (e) {}
+		}
+
+		const tabs = this._win && this._win.Zotero_Tabs;
+		for (let i = 0; i < n; i++) {
+			const entry = this._results[i].entry;
+			const row = rows[i];
+			const parts = row._zqs;
+			const d = (this._display && this._display.get(entry.id)) || null;
+
+			row.dataset.itemId = String(entry.id);
+			parts.title.textContent = (d && d.title) || '(untitled)';
+			parts.meta.textContent = (d && d.meta) || '';
+
+			if (d && d.foreign) {
+				parts.lib.textContent = d.libraryName;
+				parts.lib.hidden = false;
+			}
+			else {
+				parts.lib.hidden = true;
 			}
 
-			frag.appendChild(row);
-		});
+			// Resolved here, for the ≤50 visible rows only.
+			let tabID = null;
+			try {
+				const att = this._win.ZQS_Opener.peekAttachmentID(entry);
+				if (att && tabs) tabID = tabs.getTabIDByItemID(Number(att));
+			}
+			catch (e) {}
+			parts.badge.hidden = !tabID;
+			if (tabID) parts.badge.textContent = 'open';
+		}
 
-		this._list.replaceChildren(frag);
+		this._selectedRow = -1;
 		this._paintSelection();
 	},
 
+	/**
+	 * Touch only the two rows that changed. The previous version rewrote all 50
+	 * rows and forced a synchronous layout flush on every arrow key, including
+	 * under key repeat.
+	 */
 	_paintSelection() {
-		if (!this._list) return;
-		const rows = this._list.children;
-		if (!rows.length) return;
+		const rows = this._rows;
+		if (!rows || !rows.length) return;
 
-		// Keep the index inside the current result set at all times.
 		if (this._selectedIndex >= rows.length) this._selectedIndex = rows.length - 1;
 		if (this._selectedIndex < 0) this._selectedIndex = 0;
 
-		for (let i = 0; i < rows.length; i++) {
-			const selected = i === this._selectedIndex;
-			rows[i].classList.toggle('selected', selected);
-			rows[i].setAttribute('aria-selected', selected ? 'true' : 'false');
-			if (selected) {
-				try {
-					rows[i].scrollIntoView({ block: 'nearest' });
-				}
-				catch (e) {}
-			}
+		const prev = this._selectedRow;
+		const next = this._selectedIndex;
+		if (prev === next) return;
+
+		if (prev >= 0 && prev < rows.length) {
+			rows[prev].classList.remove('selected');
+			rows[prev].setAttribute('aria-selected', 'false');
 		}
+		const row = rows[next];
+		if (row) {
+			row.classList.add('selected');
+			row.setAttribute('aria-selected', 'true');
+			try {
+				row.scrollIntoView({ block: 'nearest' });
+			}
+			catch (e) {}
+		}
+		this._selectedRow = next;
 	},
 
 	_select(index) {

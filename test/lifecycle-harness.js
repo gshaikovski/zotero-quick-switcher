@@ -176,6 +176,44 @@ function loadBootstrap(Zotero) {
 			`before=${before} after=${unregistered.length}, listeners ${listenersAfterFirst}`);
 	}
 
+	// ---- T5: a window that was NOT ready must still attach on 'load' -------
+	{
+		const Z = makeZotero();
+		const B = loadBootstrap(Z);
+		const win = makeWindow({ ready: false });
+		await B.startup({ rootURI: 'file:///plugin/' }, 1);
+		await B.attachToWindow(win);
+		check('T5a not-ready window defers', win.listeners.length === 1);
+
+		// Window finishes loading.
+		win.ZoteroPane = {}; win.Zotero_Tabs = {}; win._ready = true;
+		const fire = win.listeners.find(l => l.t === 'load');
+		fire.fn();
+		await new Promise(r => setImmediate(r));
+		await new Promise(r => setImmediate(r));
+		check('T5b deferred attach actually completes',
+			win.ZQS_Overlay && win.ZQS_Overlay._alive === true,
+			'alive=' + (win.ZQS_Overlay && win.ZQS_Overlay._alive));
+	}
+
+	// ---- T6: a closed window that never fired unload is swept -------------
+	{
+		const Z = makeZotero();
+		const B = loadBootstrap(Z);
+		const winA = makeWindow();
+		await B.startup({ rootURI: 'file:///plugin/' }, 1);
+		await B.attachToWindow(winA);
+		const before = unregistered.length;
+
+		winA.closed = true;              // closed, but unload never fired
+		const winB = makeWindow();
+		await B.attachToWindow(winB);    // any later attach sweeps
+
+		check('T6 stale closed window is swept on next attach',
+			unregistered.length > before && winA.listeners.length === 0,
+			`unregistered +${unregistered.length - before}, listeners=${winA.listeners.length}`);
+	}
+
 	console.log(`\n${pass}/${total} passed`);
 	process.exit(pass === total ? 0 : 1);
 })();

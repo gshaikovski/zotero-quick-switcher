@@ -83,15 +83,42 @@ const Zotero = {
 const unhandled = [];
 
 let searchImpl = async () => ({ results: [], total: 0 });
-win.ZQS_Engine = { init() {}, destroy() {}, ensureIndex: async () => [], search: (...a) => searchImpl(...a) };
-win.ZQS_Opener = { init() {}, destroy() {}, openEntry: async (e) => { opened.push(e.title); } };
+win.ZQS_Engine = {
+	init: () => 'obs1', destroy() {}, ensureIndex: async () => [],
+	search: (...a) => searchImpl(...a),
+};
+win.ZQS_Opener = {
+	init: () => null, destroy() {},
+	peekAttachmentID: () => null,
+	openEntry: async (e) => { opened.push(e.t); },
+};
 
 const ctx = { Zotero, Math, JSON, console, Number, String, Array, Set, Map, Promise };
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(__dirname + '/../src/overlay.js', 'utf8'), ctx, { filename: 'overlay.js' });
 const O = ctx.ZQS_Overlay;
 
-const mkResults = (names) => names.map((t, i) => ({ entry: { id: i + 100, title: t, firstCreator: '', year: '', publication: '', attachmentID: null }, score: 1 - i * 0.1 }));
+let idSeq = 100;
+// Distinct ids per result set: reusing ids across searches would mask the very
+// staleness the click guard exists to catch.
+const mkResults = (names) => names.map((t, i) => {
+	const id = ++idSeq;
+	return {
+		entry: { id, key: 'K' + id, lib: 1, t: t.toLowerCase(), i: '', c: '', y: '', p: '', m: 0 },
+		score: 1 - i * 0.1,
+	};
+});
+// The overlay asks Zotero for display strings for the rows it shows.
+Zotero.Items = {
+	get: () => null,
+	getAsync: async (ids) => (Array.isArray(ids) ? ids : [ids]).map(id => ({
+		id, libraryID: 1,
+		getDisplayTitle: () => titleFor.get(id) || ('item ' + id),
+		getField: () => '',
+	})),
+};
+Zotero.Libraries = { userLibraryID: 1, get: () => ({ name: 'My Library' }) };
+const titleFor = new Map();
 
 let pass = 0, total = 0;
 const check = (name, cond, detail = '') => {
@@ -103,7 +130,7 @@ const check = (name, cond, detail = '') => {
 	await O.init(win, 'file:///plugin/');
 
 	// ---- T1: basic search renders and preselects first --------------------
-	searchImpl = async () => ({ results: mkResults(['alpha one', 'alpha two']), total: 2 });
+	searchImpl = async () => { const r = mkResults(['alpha one', 'alpha two']); r.forEach(x => titleFor.set(x.entry.id, x.entry.t)); return { results: r, total: 2 }; };
 	O.open();
 	O._input.value = 'alpha';
 	O._onInput(); flushTimers(); await new Promise(r => setImmediate(r));
@@ -126,7 +153,7 @@ const check = (name, cond, detail = '') => {
 
 	// ---- T3: destroy() during an in-flight search (finding 2, CRITICAL) ---
 	let release;
-	searchImpl = () => new Promise(r => { release = () => r({ results: mkResults(['late']), total: 1 }); });
+	searchImpl = () => new Promise(r => { const x = mkResults(['late']); x.forEach(y => titleFor.set(y.entry.id, y.entry.t)); release = () => r({ results: x, total: 1 }); });
 	O.open(); O._input.value = 'late'; O._onInput(); flushTimers();
 	O.destroy();                // nulls _doc/_list while search is suspended
 	release();
@@ -138,20 +165,34 @@ const check = (name, cond, detail = '') => {
 	await O.init(win, 'file:///plugin/');
 
 	// ---- T4: stale click resolves by item id, not index (finding 7) -------
-	searchImpl = async () => ({ results: mkResults(['alpha one', 'alpha two']), total: 2 });
+	searchImpl = async () => { const r = mkResults(['alpha one', 'alpha two']); r.forEach(x => titleFor.set(x.entry.id, x.entry.t)); return { results: r, total: 2 }; };
 	O.open(); O._input.value = 'alpha'; O._onInput(); flushTimers(); await new Promise(r => setImmediate(r));
-	const staleRow = O._list.children[1];         // "alpha two"
-	searchImpl = async () => ({ results: mkResults(['beta one', 'beta two']), total: 2 });
+	const staleRow = O._rows[1];                  // "alpha two"
+	O._list.dispatch('mousedown', { target: staleRow });   // press on alpha two
+	searchImpl = async () => { const r = mkResults(['beta one', 'beta two']); r.forEach(x => titleFor.set(x.entry.id, x.entry.t)); return { results: r, total: 2 }; };
 	O._input.value = 'beta'; O._onInput(); flushTimers(); await new Promise(r => setImmediate(r));
 	opened.length = 0;
 	O._list.dispatch('click', { target: staleRow, shiftKey: false, metaKey: false });
 	await new Promise(r => setImmediate(r));
-	check('T4 click on a detached stale row opens nothing (not the wrong paper)',
+	check('T4 re-render between mousedown and click opens nothing (not the wrong paper)',
 		opened.length === 0, `opened=${JSON.stringify(opened)}`);
 
+	// A normal press-and-click on a stable row must still work.
+	opened.length = 0;
+	const liveRow = O._rows[0];
+	O._list.dispatch('mousedown', { target: liveRow });
+	O._list.dispatch('click', { target: liveRow, shiftKey: false, metaKey: false });
+	await new Promise(r => setImmediate(r));
+	check('T4b ordinary click still opens the row', opened.length === 1,
+		`opened=${JSON.stringify(opened)}`);
+
 	// ---- T5: mousemove at an unchanged position must not steal selection --
+	// T4b opened a row, which closes the overlay; reopen for the pointer tests.
+	O.open();
+	O._input.value = 'beta'; O._onInput(); flushTimers();
+	await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
 	O._selectedIndex = 1; O._paintSelection();
-	const row0 = O._list.children[0];
+	const row0 = O._rows[0];
 	O._lastPointer = { x: 500, y: 400 };
 	O._list.dispatch('mousemove', { target: row0, screenX: 500, screenY: 400 });
 	check('T5 synthesized mousemove at same coords does not move selection',
@@ -159,21 +200,28 @@ const check = (name, cond, detail = '') => {
 	O._list.dispatch('mousemove', { target: row0, screenX: 501, screenY: 400 });
 	check('T5b real pointer move does select', O._selectedIndex === 0, `sel=${O._selectedIndex}`);
 
-	// ---- T6: render failure leaves _results consistent (finding 8) --------
+	// ---- T6: a display-fetch failure must not desync _results from the list --
 	const badResults = mkResults(['ok']);
-	Object.defineProperty(badResults[0].entry, 'title', { get() { throw new Error('UnloadedData'); } });
 	searchImpl = async () => ({ results: badResults, total: 1 });
-	O._input.value = 'boom'; O._onInput(); flushTimers(); await new Promise(r => setImmediate(r));
-	opened.length = 0;
-	O._activate({});
-	await new Promise(r => setImmediate(r));
-	check('T6 render failure clears _results so Enter cannot open an invisible row',
-		O._list.children.length === 0 && opened.length === 0,
-		`rows=${O._list.children.length} opened=${JSON.stringify(opened)}`);
+	const realGetAsync = Zotero.Items.getAsync;
+	Zotero.Items.getAsync = async () => { throw new Error('UnloadedData'); };
+	O._input.value = 'boom'; O._onInput(); flushTimers();
+	for (let i = 0; i < 6; i++) await new Promise(r => setImmediate(r));
+	// The row still renders (with a placeholder title) and _results agrees with
+	// what is on screen, so Enter cannot open something the user cannot see.
+	check('T6 display failure keeps _results and the list in step',
+		O._results.length === 1 && O._list.children.length === 1 && O._visible,
+		`results=${O._results.length} rows=${O._list.children.length} visible=${O._visible}`);
+	check('T6b failed display falls back to a placeholder title',
+		O._rows && O._rows[0]._zqs.title.textContent === '(untitled)',
+		O._rows ? JSON.stringify(O._rows[0]._zqs.title.textContent) : 'no rows');
+	Zotero.Items.getAsync = realGetAsync;
 
 	// ---- T7: arrow wrap + Enter opens the selected row --------------------
-	searchImpl = async () => ({ results: mkResults(['one', 'two', 'three']), total: 3 });
-	O._input.value = 'x'; O._onInput(); flushTimers(); await new Promise(r => setImmediate(r));
+	searchImpl = async () => { const r = mkResults(['one', 'two', 'three']); r.forEach(x => titleFor.set(x.entry.id, x.entry.t)); return { results: r, total: 3 }; };
+	O._input.value = 'x'; O._onInput(); flushTimers();
+	// _runSearch awaits both the scan and the display fetch, so drain a few turns.
+	for (let i = 0; i < 6; i++) await new Promise(r => setImmediate(r));
 	O._move(-1);                                  // wrap backwards from 0 -> 2
 	opened.length = 0;
 	O._activate({});

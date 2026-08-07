@@ -181,3 +181,32 @@
 	color: var(--fill-secondary, GrayText);
 	border-top: 1px solid var(--color-border, ThreeDShadow);
 }
+
+/* ---------------- library provenance ---------------- */
+
+/* Shown only for items outside My Library. Item metadata is attacker-
+   controlled, and anyone with write access to a shared group library can craft
+   a title that outranks your own paper for a query you type habitually. Naming
+   the source makes that visible instead of silent. */
+#zqs-overlay .zqs-lib {
+	flex: 0 0 auto;
+	max-width: 12em;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 0.72em;
+	padding: 2px 7px;
+	border-radius: 999px;
+	border: 1px solid var(--color-border, ThreeDShadow);
+	color: var(--fill-secondary, GrayText);
+}
+
+#zqs-overlay .zqs-row.selected .zqs-lib {
+	border-color: rgba(255, 255, 255, 0.4);
+	color: inherit;
+}
+
+#zqs-overlay .zqs-lib[hidden],
+#zqs-overlay .zqs-badge[hidden] {
+	display: none;
+}

@@ -57,8 +57,33 @@ function isWindowReady(win) {
 	return !!(win && win.document && win.ZoteroPane && win.Zotero_Tabs);
 }
 
+/**
+ * Detach any window we are still tracking that has since closed. A missed
+ * onMainWindowUnload would otherwise pin that ChromeWindow, its document and
+ * its whole index for the rest of the session; this bounds the damage to the
+ * gap before the next attach.
+ */
+function sweepDeadWindows() {
+	for (const win of [...windowState.keys()]) {
+		let dead = false;
+		try {
+			dead = win.closed === true;
+		}
+		catch (e) {
+			dead = true; // window is gone far enough that property access throws
+		}
+		if (dead) {
+			try {
+				detachFromWindow(win);
+			}
+			catch (e) {}
+		}
+	}
+}
+
 async function attachToWindow(win) {
 	if (!rootURI) return; // shut down, or not started yet
+	sweepDeadWindows();
 	if (!win || windowState.has(win) || pendingWindows.has(win)) return;
 
 	if (!isWindowReady(win)) {
@@ -66,8 +91,11 @@ async function attachToWindow(win) {
 		// fires after teardown, when rootURI is null, and tries to load
 		// "nullsrc/engine.js".
 		const onLoad = () => {
-			const state = windowState.get(win);
-			if (state) state.onLoad = null;
+			// The placeholder entry MUST be removed before recursing: the guard
+			// above rejects any window already in windowState, so leaving it
+			// would make this branch dead code and the plugin permanently inert
+			// on a window that was not ready the first time we saw it.
+			windowState.delete(win);
 			attachToWindow(win).catch((e) => {
 				Zotero.logError(new Error('[quick-switcher] deferred attach failed: ' + e));
 			});
@@ -91,6 +119,14 @@ async function attachToWindow(win) {
 				win.ZQS_Overlay.destroy();
 			}
 			catch (e) {}
+			// Belt and braces: destroy() normally unregisters these, but this
+			// branch must not depend on the window still being reachable.
+			for (const id of (handles && handles.notifierIDs) || []) {
+				try {
+					Zotero.Notifier.unregisterObserver(id);
+				}
+				catch (e) {}
+			}
 			for (const name of MODULE_GLOBALS) {
 				try {
 					win[name] = undefined;

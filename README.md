@@ -60,67 +60,96 @@ using"* — matching double-click behaviour, but meaning Enter may not produce a
 
 ## How it works
 
-Zotero's search returns matching item IDs with **no relevance score and no ordering** — there's no
-`ORDER BY` anywhere in `search.js`. Ranking has to happen client-side regardless, and once you're
-ranking client-side, `Zotero.Search` costs more than it gives: its `contains` operator compiles to
-SQL `LIKE '%token%'`, so a candidate must contain every token as a literal substring. That makes
-fuzzy matching impossible — `aiayn` could never reach the ranker.
+Zotero has no search index you can reuse for this. The `fulltextWords` tables are a hand-rolled
+inverted index over **PDF file text only** — they contain no titles and no creators. And
+`itemDataValues.value` carries a `UNIQUE BINARY` index usable only for `=`, so every
+`LIKE '%token%'` degrades to a full table scan.
 
-So the plugin keeps its own index instead:
+Three approaches were measured against a 100k-paper library built on Zotero's real schema:
 
-1. **Index** (`src/engine.js`). Built once at startup from `Zotero.Items.getAll()` per library, and
-   rebuilt when the Notifier reports item changes. For each paper it stores lowercased title,
-   title initials, short title, creators (in *both* name orders), year, venue and citation key —
-   plus the id of the attachment that would open, resolved synchronously so the `open` badge needs
-   no async work per row.
-2. **Rank.** Per token, per field, strongest match wins: exact > prefix > word-start > substring >
-   subsequence. Title outweighs creators, which outweigh venue and year. Whole-query bonuses push an
-   exact or prefix title match to the top, and a mild brevity preference keeps a short precise title
-   above a long one containing the same words. Every token must match something, so multi-word
-   queries narrow rather than broaden. Ties break on most-recently-modified.
+| Approach | Build | Per keystroke | Memory | Fuzzy? |
+|---|---|---|---|---|
+| `Zotero.Items.getAll` + `getAsync` + `loadDataTypes` | seconds | 50–260 ms | 194 MB **+ ~376 MB** permanently retained in Zotero's `_objectCache` | yes |
+| `Zotero.Search` (SQL `LIKE`) per keystroke | none | 81–92 ms | ~0 | **no** |
+| **One SQL query → compact in-memory index** | 214 ms once | **6–37 ms** | **31 MB** | yes |
+
+The third is what this plugin does. Note the second is the *slowest* — SQL cannot help here, because
+there is no index to use and no way to express subsequence matching.
+
+**1. Index** (`src/engine.js`). One static SQL query via `Zotero.DB.queryAsync`, built lazily on your
+first Cmd+O. It never materialises `Zotero.Item` objects — that is what caused the 376 MB of
+permanently retained heap, since every item touched is pinned in Zotero's unbounded object cache for
+the session. `baseFieldMappingsCombined` resolves type-specific fields onto their base field, so a
+conference paper's `proceedingsTitle` and a case's `caseName` land in the right place. Annotations
+are excluded in SQL — at 100k papers a library holds ~250k of them, and Zotero's own
+`getAll(onlyTopLevel)` does *not* filter them out.
+
+The index stores only what matching needs: normalised strings, a character bitmap, an id and a
+stable key — **325 bytes per paper**. Everything you see on screen is fetched from Zotero for the
+≤50 rows actually displayed.
+
+**2. Rank.** Per token, per field, strongest match wins: exact > prefix > word-start > substring >
+subsequence. Title outweighs creators, which outweigh venue and year. Every token must match
+something, so multi-word queries narrow rather than broaden.
+
+Two things keep this fast. A **character bitmap** per entry rejects most candidates with a single
+integer AND before any string work — 122× faster on selective queries, and it flattens the
+adversarial many-token case that would otherwise be quadratic. And field scoring **short-circuits**,
+so a perfect title match never bothers scoring the venue.
+
+**3. Scan.** Chunked and abandonable: the scan yields to the event loop between slices, so the UI
+never blocks, and a superseded search stops the moment you type another character. Typing ten
+characters costs roughly one scan, not ten.
 
 That yields the fuzzy behaviour you'd expect: `attention`, `attention need`, `atten`, `aiayn` and
-`atnisallyn` all find *Attention Is All You Need*.
+`atnisallyn` all find *Attention Is All You Need*, as do `LeCun, Yann`, `(LeCun 2015)`, a pasted
+citation title ending in a period, and `uber` for *Über…*.
 
 `src/opener.js` resolves the paper to its reader-openable attachment and calls
 `Zotero.Reader.open()`, which **already does its own already-open detection** — it selects the
 existing tab, loaded or unloaded, rather than duplicating it. So "switch to the existing tab" is
-Zotero's own behaviour, not a reimplementation. Papers with no openable attachment fall back to
-Zotero's url/DOI handling, and finally to revealing the item in the library, so Enter always does
-something visible.
+Zotero's own behaviour, not a reimplementation.
 
-`src/overlay.js` builds the UI as a `position: fixed` XHTML div appended to `documentElement` —
-the same construct as Zotero's `#zotero-tab-cover`, which demonstrably paints over a PDF reader. A
-XUL `<panel>` was the other candidate and was rejected: it hijacks Escape (Zotero's own source
-comments on having to work around this), and on macOS it's a separate native window whose hide
-races the focus hook that runs when tabs switch.
+`src/overlay.js` builds the UI as a `position: fixed` XHTML div appended to `documentElement` — the
+same construct as Zotero's `#zotero-tab-cover`, which demonstrably paints over a PDF reader. A XUL
+`<panel>` was rejected: it hijacks Escape (Zotero's own source comments on working around this), and
+on macOS it is a separate native window whose hide races the focus hook that runs when tabs switch.
 
 The hotkey is a **capture-phase** `keydown` listener on the chrome window. The reader is an
 in-process, non-remote `<browser>`, so its key events travel through the chrome window, and capture
 runs before the reader's own handler can swallow the combo. This is the same mechanism Zotero uses
 to make Cmd+W close a reader tab while the PDF has focus.
 
-## Tests
+## Security
 
-```sh
-./test/run.sh
-```
+This runs with system privileges inside Zotero, and **item metadata is attacker-controlled** — it
+arrives via BibTeX/RIS import, DOI lookup, the browser connector, and group libraries other people
+can write to. The design accounts for that:
 
-The harnesses execute `src/engine.js` and `src/overlay.js` in Node against stubbed Zotero and DOM
-objects. They need no Zotero install and never touch your profile. 55 assertions covering:
-
-- ranking, including the fuzzy and acronym cases (`aiayn` → *Attention Is All You Need*)
-- text normalisation — pasted citation titles ending in a period, `Last, First` author form,
-  parenthesised `(LeCun 2015)` citations, hyphenated queries, apostrophes, and diacritics
-  (`uber` finds *Über…*)
-- hotkey matching across keyboard layouts, including Dvorak and named keys like `alt+space`
-- the overlay state machine — a dismissed query rendering into a reopened switcher, teardown
-  during an in-flight search, a click on a stale row opening the wrong paper, and the synthesized
-  mousemove that could steal the keyboard selection
-- the index-rebuild race, where an item changing mid-scan must leave the index dirty
+- **The SQL is entirely static.** Your query never reaches SQL, so injection is impossible by
+  construction rather than by escaping.
+- **Every indexed field is length-capped.** An uncapped 10 MB title costs 1,261 ms and 22 MB for a
+  single item; capped, it is 1 ms and bounded. Query length and token count are capped too.
+- **Rendering is `textContent` only** — no `innerHTML` anywhere — and titles are stripped of
+  bidirectional overrides and zero-width characters, which could otherwise make a row read as a
+  different paper than the one Enter opens.
+- **Results from outside My Library are badged with their library name.** Anyone with write access
+  to a shared group library can craft a title that outranks your own paper for a query you type
+  habitually; naming the source makes that visible instead of silent.
+- **Entries carry the item's stable key.** SQLite reuses rowids after deletion, so an id cached at
+  index time is re-checked before anything is opened.
+- **Debug output never contains item titles.** Zotero's Debug Output is routinely submitted to
+  support, and your library is your private research.
+- `update_url` deliberately points at an unroutable address. It is a required manifest field, but
+  pointing it at a namespace that could later be re-registered would let whoever claimed it push
+  system-privileged JavaScript to this plugin.
 
 ## Known limitations
 
+- **Very large libraries are capped at 200,000 papers**, most-recently-modified first (~62 MB).
+  Beyond that the older tail is not fuzzy-searchable. The status line says so when it applies.
+- The index rebuilds wholesale when items change, rate-limited to once every 5 seconds. Patching
+  individual items incrementally would be faster during a large sync but is not implemented.
 - A reader opened in its **own window** (rather than a tab) doesn't get the overlay — that's a
   separate window type which never receives `onMainWindowLoad`.
 - If a paper is already open in a reader *window* rather than a tab, Enter matches that window and
