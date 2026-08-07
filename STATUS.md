@@ -43,8 +43,8 @@ permanently retained** in Zotero's object cache, and 50–260 ms of *blocking* p
   exhaustive scan.
 - **Lazy index build.** Zero cost to Zotero's startup. The build kicks off the moment the overlay
   opens, so it overlaps your first keystrokes rather than following them.
-- **200k paper cap, newest first.** Bounded at ~62 MB. Beyond that the older tail is not
-  fuzzy-searchable, and the status line says so.
+- **200k paper cap, newest first.** Bounded at ~75 MB. Beyond that the older tail is not searchable
+  here, and the status line says so.
 - **Chunked, abandonable scanning.** The UI never blocks, and typing ten characters costs about one
   scan rather than ten.
 
