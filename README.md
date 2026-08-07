@@ -8,6 +8,8 @@ PDF you're reading — type a few words, and jump straight to a paper.
 - First result preselected; arrow keys move the selection (wrapping at the ends)
 - **Enter** opens the paper in a tab, or switches to its tab if it's already open
 
+<img width="718" height="692" alt="image" src="https://github.com/user-attachments/assets/9e8977b3-57d0-4a26-92f0-2a85cbee7a7a" />
+
 Rows already open in a tab are badged `open`.
 
 | Key | Action |
