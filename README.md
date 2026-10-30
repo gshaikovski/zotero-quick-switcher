@@ -30,11 +30,11 @@ Build the `.xpi`:
 ./build.sh
 ```
 
-That writes `build/zotero-quick-switcher-0.1.0.xpi`. Then, in Zotero:
+That writes `build/zotero-quick-switcher-1.0.0.xpi`. Then, in Zotero:
 
 1. **Tools → Plugins**
 2. Gear icon (top right) → **Install Plugin From File…**
-3. Pick `build/zotero-quick-switcher-0.1.0.xpi`
+3. Pick `build/zotero-quick-switcher-1.0.0.xpi`
 4. Restart Zotero
 
 Press **Cmd+O** to open the switcher.

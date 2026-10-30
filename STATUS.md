@@ -22,7 +22,7 @@ not assumed.
 ```
 
 Then Zotero → **Tools → Plugins** → gear icon → **Install Plugin From File…** → pick
-`build/zotero-quick-switcher-0.1.0.xpi` → restart Zotero. Press **Cmd+O**.
+`build/zotero-quick-switcher-1.0.0.xpi` → restart Zotero. Press **Cmd+O**.
 
 ## Measured behaviour
 

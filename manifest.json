@@ -1,7 +1,7 @@
 {
 	"manifest_version": 2,
 	"name": "Quick Switcher",
-	"version": "0.1.0",
+	"version": "1.0.0",
 	"description": "Obsidian-style quick switcher for Zotero. Press Cmd+O from any tab to search your library and jump straight to a paper.",
 	"homepage_url": "https://github.com/gshaikov/zotero-quick-switcher",
 	"applications": {
