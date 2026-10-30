@@ -200,13 +200,19 @@ default.
 
 ## Releasing
 
-Zotero's update check reads `updates.json` from `main` (the manifest's `update_url`), and
-`./build.sh` regenerates that file — version, download link and SHA-256 — from `manifest.json`.
+```sh
+make release VERSION=1.0.1                  # notes generated from commits
+make release VERSION=1.0.1 NOTES=notes.md   # or your own notes
+```
 
-1. Bump `version` in `manifest.json` and run `./build.sh`
-2. Commit, including `updates.json`, and tag `vX.Y.Z`
-3. `gh release create vX.Y.Z build/zotero-quick-switcher-X.Y.Z.xpi`
-4. Push `main` **after** the release exists, so `update_link` never points at a missing file
+`release.sh` refuses to start unless you are on a clean `main` that matches `origin/main` and the
+tag doesn't exist yet. It then bumps `manifest.json`, runs the tests, builds the `.xpi` and
+`updates.json`, commits, tags, pushes the tag, creates the GitHub release with the `.xpi` attached,
+and pushes `main` **last**. Zotero's update check reads `updates.json` from `main`, so this order
+means it never offers a download link that doesn't exist yet. If a publish step fails, the script
+prints how to finish or undo.
+
+`make build` and `make test` run `./build.sh` and `test/run.sh`.
 
 ## Troubleshooting
 
