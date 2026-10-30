@@ -157,9 +157,6 @@ can write to. The design accounts for that:
   index time is re-checked before anything is opened.
 - **Debug output never contains item titles.** Zotero's Debug Output is routinely submitted to
   support, and your library is your private research.
-- `update_url` deliberately points at an unroutable address. It is a required manifest field, but
-  pointing it at a namespace that could later be re-registered would let whoever claimed it push
-  system-privileged JavaScript to this plugin.
 
 ## Known limitations
 
