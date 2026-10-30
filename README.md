@@ -1,6 +1,6 @@
 # Zotero Quick Switcher
 
-An Obsidian-style quick switcher for Zotero 9. Press **Cmd+O** from any tab — the library tab or a
+An Obsidian-style quick switcher for Zotero. Press **Cmd+O** from any tab — the library tab or a
 PDF you're reading — type a few words, and jump straight to a paper.
 
 - Overlay search bar, available from any tab
