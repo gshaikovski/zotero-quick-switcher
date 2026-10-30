@@ -9,6 +9,10 @@ const PAPERS = [
 	{ id: 4, title: 'Attention', creators: [['Jane', 'Smith']], year: '1999', pub: 'Psychology Today' },
 	{ id: 5, title: 'A Survey of Deep Learning for Attention Mechanisms in Vision', creators: [['Li', 'Wang']], year: '2021', pub: 'ACM Computing Surveys' },
 	{ id: 6, title: 'Language Models are Few-Shot Learners', creators: [['Tom', 'Brown']], year: '2020', pub: 'NeurIPS' },
+	{ id: 7, title: 'Human-level Control Through Deep Reinforcement Learning', creators: [['Volodymyr', 'Mnih']], year: '2015', pub: 'Nature' },
+	{ id: 8, title: 'Squeeze-and-Excitation Networks', creators: [['Jie', 'Hu'], ['Li', 'Shen']], year: '2018', pub: 'CVPR' },
+	{ id: 9, title: 'Learning to Reason Efficiently', creators: [['Andreas', 'Opedal'], ['Abulhair', 'Saparov']], year: '2025', pub: 'arXiv' },
+	{ id: 10, title: 'Transformers Struggle to Learn to Search', creators: [['Abulhair', 'Saparov'], ['Srushti', 'Pawar']], year: '2025', pub: 'ICLR' },
 ];
 
 let pass = 0, total = 0;
@@ -56,6 +60,11 @@ const check = (name, cond, detail = '') => {
 	console.log('\n--- creator order ---');
 	await t('first last', 'kaiming he', 2);
 	await t('last first', 'he kaiming', 2);
+
+	console.log('\n--- surname ---');
+	await t('surname over title word', 'hu', 8);
+	await t('first author wins', 'saparov', 10);
+	await t('second author found', 'shen', 8);
 
 	console.log('\n--- year / venue ---');
 	await t('creator + year', 'brown 2020', 6);

@@ -224,6 +224,16 @@ const win = { setTimeout(fn) { timers.push(fn); return timers.length; }, clearTi
 		`${r1.results.length} results`);
 	const r2 = await runSearch('vaswani');
 	check('search matches on creator', r2.results.length === 1);
+	const aiayn = byTitle.get('attention is all you need');
+	check('surnames are indexed in author order, first author known',
+		aiayn && aiayn.s === 'vaswani shazeer' && aiayn.s.slice(0, aiayn.f) === 'vaswani',
+		aiayn ? JSON.stringify([aiayn.s, aiayn.f]) : '');
+	const r2b = await runSearch('shazeer');
+	check('search matches a non-first author surname', r2b.results.length === 1
+		&& r2b.results[0].entry.key === 'AAAAAAAA');
+	const r2c = await runSearch('lovelace');
+	check('exact surname outranks everything else', r2c.results.length >= 1
+		&& r2c.results[0].entry.key === 'BBBBBBBB');
 	const r3 = await runSearch('aiayn');
 	check('fuzzy acronym works against real data', r3.results.length === 1);
 

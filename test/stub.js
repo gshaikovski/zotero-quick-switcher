@@ -24,6 +24,7 @@ function makeZotero(papers = [], opts = {}) {
 		.map(p => ({
 			itemID: p.id,
 			names: p.creators.map(([f, l]) => l + ' ' + f).join(' '),
+			surnames: p.creators.map(([, l]) => l).join('\x1f'),
 		}));
 
 	const items = new Map();

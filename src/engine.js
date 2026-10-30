@@ -54,6 +54,12 @@ var ZQS_Engine = {
 	/** Per-field character caps. Hostile metadata must not become our problem. */
 	CAP_TITLE: 400,
 	CAP_CREATORS: 400,
+	/**
+	 * Surnames get a far larger cap than full names: a large collaboration
+	 * (Llama 3, BLOOM) lists hundreds of authors, and at 400 characters every
+	 * author after roughly the 30th was unsearchable. Still bounded.
+	 */
+	CAP_SURNAMES: 4000,
 	CAP_PUBLICATION: 160,
 	/** Longest query we will process; longer is truncated. */
 	CAP_QUERY: 512,
@@ -66,6 +72,8 @@ var ZQS_Engine = {
 		title: 1.0,
 		initials: 0.9,
 		creators: 0.85,
+		/** Exact surname; first author gets the full 1.0, others this. */
+		surname: 0.95,
 		year: 0.6,
 		publication: 0.4,
 	},
@@ -253,12 +261,22 @@ var ZQS_Engine = {
 		ORDER BY i.dateModified DESC
 	`,
 
-	SQL_CREATORS: `SELECT ic.itemID, group_concat(c.lastName || ' ' || c.firstName, ' ') AS names
-		FROM itemCreators ic
-		JOIN creators c ON c.creatorID = ic.creatorID
-		JOIN items i ON i.itemID = ic.itemID
-		WHERE i.libraryID = ?
-		GROUP BY ic.itemID
+	/**
+	 * Creators in author order (the inner ORDER BY feeds group_concat), so
+	 * the caps drop the tail of the author list rather than arbitrary names,
+	 * and the first author is known. Surnames are joined with char(31) so the
+	 * first one can be split off even when it is several words ("van der Berg").
+	 */
+	SQL_CREATORS: `SELECT itemID,
+			group_concat(lastName || ' ' || COALESCE(firstName, ''), ' ') AS names,
+			group_concat(lastName, char(31)) AS surnames
+		FROM (SELECT ic.itemID, c.lastName, c.firstName
+			FROM itemCreators ic
+			JOIN creators c ON c.creatorID = ic.creatorID
+			JOIN items i ON i.itemID = ic.itemID
+			WHERE i.libraryID = ?
+			ORDER BY ic.itemID, ic.orderIndex)
+		GROUP BY itemID
 	`,
 
 	/**
@@ -342,7 +360,7 @@ var ZQS_Engine = {
 		}
 
 		const creators = new Map();
-		for (const r of (creatorRows || [])) creators.set(r.itemID, r.names);
+		for (const r of (creatorRows || [])) creators.set(r.itemID, r);
 
 		// Feeds need no special handling now: they are separate libraries, and
 		// only the user library is queried.
@@ -370,8 +388,13 @@ var ZQS_Engine = {
 				(row.title || '').slice(0, this.CAP_TITLE));
 			if (!title) continue; // nothing searchable
 
+			const cr = creators.get(row.itemID);
 			const creatorStr = this.normalize(
-				(creators.get(row.itemID) || '').slice(0, this.CAP_CREATORS));
+				((cr && cr.names) || '').slice(0, this.CAP_CREATORS));
+			const surnameParts = ((cr && cr.surnames) || '')
+				.slice(0, this.CAP_SURNAMES).split('\x1f');
+			const firstSurname = this.normalize(surnameParts[0]);
+			const surnames = this.normalize(surnameParts.join(' '));
 			const pub = this.normalize(
 				(row.pub || '').slice(0, this.CAP_PUBLICATION));
 			const year = (row.date || '').slice(0, 4);
@@ -383,9 +406,12 @@ var ZQS_Engine = {
 				t: title,
 				i: this._initials(title),
 				c: creatorStr,
+				s: surnames,
+				f: firstSurname.length, // s.slice(0, f) is the first author
 				y: year,
 				p: pub,
-				m: this._mask(title + ' ' + creatorStr + ' ' + year + ' ' + pub),
+				m: this._mask(title + ' ' + creatorStr + ' ' + surnames + ' '
+					+ year + ' ' + pub),
 			});
 		}
 
@@ -426,6 +452,7 @@ var ZQS_Engine = {
 			};
 			add(e.t);
 			add(e.c);
+			add(e.s);
 			add(e.p);
 			if (e.y) add(e.y);
 			if (e.i) add(e.i);   // so an acronym query hits the fast path too
@@ -550,6 +577,31 @@ var ZQS_Engine = {
 	},
 
 	/**
+	 * Surname match: whole word or word prefix only, never fuzzy — "lee" must
+	 * mean Lee, not any title with l…e…e in it. A match inside the first
+	 * author's surname scores highest.
+	 * @returns {Number} 1.0 first-author exact, 0.95 exact, 0.8/0.75 prefix, 0
+	 */
+	_surnameScore(token, s, f) {
+		if (!s || !token) return 0;
+		let best = 0;
+		let idx = s.indexOf(token);
+		while (idx !== -1) {
+			if (idx === 0 || s.charCodeAt(idx - 1) === 32) {
+				const end = idx + token.length;
+				const exact = end === s.length || s.charCodeAt(end) === 32;
+				const first = idx < f;
+				const score = exact ? (first ? 1.0 : this.WEIGHTS.surname)
+					: (first ? 0.8 : 0.75);
+				if (score > best) best = score;
+				if (best === 1.0) break;
+			}
+			idx = s.indexOf(token, idx + 1);
+		}
+		return best;
+	},
+
+	/**
 	 * Fuzzy tier: token characters present in order, scored by how tightly
 	 * packed the match is. This is what SQL LIKE cannot express and the whole
 	 * reason the index exists — "aiayn" → "Attention Is All You Need".
@@ -580,6 +632,7 @@ var ZQS_Engine = {
 		const W = this.WEIGHTS;
 		let total = 0;
 		let allInTitle = true;
+		let surnameBonus = 0;
 
 		for (let k = 0; k < tokens.length; k++) {
 			const token = tokens[k];
@@ -589,6 +642,14 @@ var ZQS_Engine = {
 			if (best < 1.0) {
 				if (entry.i && entry.i.startsWith(token) && W.initials > best) {
 					best = W.initials;
+				}
+				if (entry.s) {
+					const s = this._surnameScore(token, entry.s, entry.f);
+					// An exact surname is a deliberate author search: boost it
+					// past title words that merely start with the query
+					// ("hu" must find Hu before "human").
+					if (s >= W.surname) surnameBonus += (s === 1.0 ? 0.5 : 0.45);
+					if (s > best) best = s;
 				}
 				if (best < W.creators) {
 					const c = W.creators * this.scoreToken(token, entry.c);
@@ -609,7 +670,7 @@ var ZQS_Engine = {
 			total += best;
 		}
 
-		let score = total / tokens.length;
+		let score = (total + surnameBonus) / tokens.length;
 
 		// Whole-query bonuses: what puts the obviously-right paper first.
 		if (q) {
