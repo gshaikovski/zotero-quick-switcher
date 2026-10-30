@@ -24,7 +24,12 @@ Rows already open in a tab are badged `open`.
 
 ## Install
 
-Build the `.xpi`:
+Download the `.xpi` from the
+[latest release](https://github.com/gshaikovski/zotero-quick-switcher/releases/latest) and install
+it as in steps 1–4 below. Zotero then updates the plugin itself (**Tools → Plugins → gear → Check
+for Updates**).
+
+Or build the `.xpi` yourself:
 
 ```sh
 ./build.sh
@@ -192,6 +197,16 @@ defaults make it fail *silently*, which is worth knowing before you lose an hour
 
 Unsigned plugins need no pref changes — Zotero sets `xpinstall.signatures.required = false` by
 default.
+
+## Releasing
+
+Zotero's update check reads `updates.json` from `main` (the manifest's `update_url`), and
+`./build.sh` regenerates that file — version, download link and SHA-256 — from `manifest.json`.
+
+1. Bump `version` in `manifest.json` and run `./build.sh`
+2. Commit, including `updates.json`, and tag `vX.Y.Z`
+3. `gh release create vX.Y.Z build/zotero-quick-switcher-X.Y.Z.xpi`
+4. Push `main` **after** the release exists, so `update_link` never points at a missing file
 
 ## Troubleshooting
 

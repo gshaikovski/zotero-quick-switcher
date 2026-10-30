@@ -1,0 +1,19 @@
+{
+	"addons": {
+		"quick-switcher@zotero-search.app": {
+			"updates": [
+				{
+					"version": "1.0.0",
+					"update_link": "https://github.com/gshaikovski/zotero-quick-switcher/releases/download/v1.0.0/zotero-quick-switcher-1.0.0.xpi",
+					"update_hash": "sha256:372b42578c4e1c550e45cf3dd6b76eb77efa9e269b97bb659d681d9198e10159",
+					"applications": {
+						"zotero": {
+							"strict_min_version": "7.0",
+							"strict_max_version": "10.*"
+						}
+					}
+				}
+			]
+		}
+	}
+}
